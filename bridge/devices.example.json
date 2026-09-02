@@ -1,0 +1,35 @@
+{
+  "_comment": "Copy this to devices.json and fill in as you add hardware. Everything here is OPTIONAL — the assistant runs fine with an empty config and you add devices later. Get Tuya deviceId/localKey with:  python -m tinytuya wizard",
+
+  "lights": {
+    "bedroom": { "id": "PUT_TUYA_DEVICE_ID", "ip": "192.168.1.60", "key": "PUT_LOCAL_KEY", "version": "3.4" },
+    "desk":    { "id": "PUT_TUYA_DEVICE_ID", "ip": "192.168.1.61", "key": "PUT_LOCAL_KEY", "version": "3.4" }
+  },
+
+  "plugs": {
+    "fan":   { "id": "PUT_TUYA_DEVICE_ID", "ip": "192.168.1.62", "key": "PUT_LOCAL_KEY", "version": "3.4" }
+  },
+
+  "mqtt": { "host": "localhost", "port": 1883 },
+
+  "apps": {
+    "spotify": "spotify.exe",
+    "chrome":  "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
+    "notepad": "notepad.exe",
+    "vscode":  "code"
+  },
+
+  "_devices_comment": "Named devices on your LAN for 'control_device' — say e.g. 'turn on the fan node' or 'wake my desktop'. Types: wol (wake a PC by MAC), http (call a URL, e.g. an ESP32 relay with /on and /off endpoints), light/plug (Tuya), mqtt (a custom ESP node), ping (status only).",
+  "devices": {
+    "desktop":   { "type": "wol",  "mac": "AA-BB-CC-DD-EE-FF", "ip": "192.168.1.20" },
+    "fan node":  { "type": "http", "ip": "192.168.1.71",
+                   "commands": { "on": "http://192.168.1.71/on", "off": "http://192.168.1.71/off" } },
+    "living lamp": { "type": "light", "id": "PUT_TUYA_DEVICE_ID", "ip": "192.168.1.63", "key": "PUT_LOCAL_KEY", "version": "3.4" },
+    "printer":   { "type": "ping", "ip": "192.168.1.50" }
+  },
+
+  "_computers_comment": "Other laptops/PCs running agent/hermes_agent.py, for 'open X on the other laptop'. Get each one's URL from what the agent prints when it starts. Token must match this brain's HERMES_TOKEN.",
+  "computers": {
+    "other laptop": { "url": "http://192.168.1.30:8799", "token": "YOUR_HERMES_TOKEN" }
+  }
+}

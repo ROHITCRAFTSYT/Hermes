@@ -1,0 +1,31 @@
+# ── Secrets & personal config (NEVER commit) ────────────────────────────────
+bridge/.env
+firmware/hermes_satellite/secrets.h
+firmware/hermes_satellite/config.h
+bridge/devices.json
+bridge/conversation.json
+bridge/memory.json
+
+# ── Python ──────────────────────────────────────────────────────────────────
+**/.venv/
+**/.venv*/
+**/venv/
+**/__pycache__/
+*.pyc
+*.pyo
+
+# ── Build / logs / scratch ──────────────────────────────────────────────────
+*.log
+**/build/
+firmware/**/_*.log
+bridge/_*.py
+bridge/_*.log
+bridge/_*.out
+bridge/_*.err
+bridge/_direct.*
+*.tmp
+
+# ── OS ──────────────────────────────────────────────────────────────────────
+Thumbs.db
+.DS_Store
+desktop.ini

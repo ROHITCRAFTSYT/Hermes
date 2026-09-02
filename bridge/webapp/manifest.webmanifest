@@ -1,0 +1,13 @@
+{
+  "name": "Hermes Home Agent",
+  "short_name": "Hermes",
+  "description": "Control your home, PC, and the web by voice — from anywhere.",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "background_color": "#0d1012",
+  "theme_color": "#0d1012",
+  "icons": [
+    { "src": "icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any maskable" }
+  ]
+}

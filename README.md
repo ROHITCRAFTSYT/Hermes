@@ -1,5 +1,10 @@
 # Hermes — a DIY voice AI agent for your home
 
+![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)
+![Platform](https://img.shields.io/badge/platform-Windows%20%2B%20ESP32-lightgrey)
+![Python](https://img.shields.io/badge/python-3.11%2B-blue)
+![AI](https://img.shields.io/badge/AI-Groq%20%C2%B7%20Whisper%20%C2%B7%20NVIDIA-ff8a41)
+
 Hermes turns a **₹1,500 ESP32** into a hands‑held voice assistant that runs on
 your own PC. Hold the button, talk (in **English or Tamil**), and it answers out
 loud — and unlike a closed smart speaker, it can **open apps and websites, search

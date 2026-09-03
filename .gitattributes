@@ -1,0 +1,22 @@
+# Normalize line endings so the repo is clean across Windows/macOS/Linux.
+* text=auto
+
+# Source stays LF
+*.py   text eol=lf
+*.md   text eol=lf
+*.h    text eol=lf
+*.ino  text eol=lf
+*.json text eol=lf
+*.js   text eol=lf
+*.html text eol=lf
+*.svg  text eol=lf
+*.webmanifest text eol=lf
+
+# Windows scripts must stay CRLF
+*.bat  text eol=crlf
+
+# Binaries
+*.ico  binary
+*.png  binary
+*.jpg  binary
+*.gif  binary

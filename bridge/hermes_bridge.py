@@ -16,6 +16,7 @@ Run:  .venv\\Scripts\\python hermes_bridge.py
 import os
 import json
 import base64
+import io
 import html
 import socket
 import asyncio
@@ -444,9 +445,141 @@ def _run_agent_locked(user_text: str) -> str:
     return re.sub(r"(?<=[a-zA-Z0-9])\.(?=[A-Z])", ". ", reply)
 
 
-# ── Text -> speech (Windows SAPI, local & free) ──────────────────────────────
+# ── Text -> speech ───────────────────────────────────────────────────────────
+# Neural voices from Microsoft's Edge "Read aloud" service (free, no key; English + Tamil).
+# Falls back to the offline Windows voice (gTTS for Tamil) when it's unreachable or slow.
+
+TTS_ENGINE = os.getenv("TTS_ENGINE", "edge").lower()          # edge | sapi
+TTS_VOICE = os.getenv("TTS_VOICE", "en-US-AvaMultilingualNeural")
+TTS_VOICE_TA = os.getenv("TTS_VOICE_TA", "ta-IN-PallaviNeural")
+TTS_RATE = os.getenv("TTS_RATE", "+0%")                        # e.g. +10% to speak faster
+TTS_HEDGE_S = float(os.getenv("TTS_HEDGE_S", "2.5"))     # no audio by then: race a second connection
+TTS_TOTAL_S = float(os.getenv("TTS_TOTAL_S", "8"))        # then give up and use the fallback voice
+_TTS_CACHE: dict[tuple, bytes] = {}   # repeated phrases ("Sorry, I didn't catch that.") skip the network
+
+
+def _edge_mp3(text: str) -> bytes | None:
+    if TTS_ENGINE != "edge":
+        return None
+    voice = TTS_VOICE_TA if _has_tamil(text) else TTS_VOICE
+    key = (voice, TTS_RATE, text)
+    if key in _TTS_CACHE:
+        return _TTS_CACHE[key]
+    import edge_tts
+
+    async def fetch(got_audio: asyncio.Event):
+        stream = edge_tts.Communicate(text, voice, rate=TTS_RATE).stream()
+        chunks = []
+        try:
+            while True:
+                c = await asyncio.wait_for(stream.__anext__(), 5.0 if chunks else TTS_TOTAL_S)
+                if c["type"] == "audio":
+                    chunks.append(c["data"])
+                    got_audio.set()
+        except StopAsyncIteration:
+            return b"".join(chunks)
+        finally:
+            try:
+                await stream.aclose()
+            except Exception:
+                pass
+
+    async def hedged():
+        # Some requests stall with no audio at all while a fresh one is fine (often on mobile
+        # hotspots). If the first audio is late, race a second connection; keep whichever finishes.
+        tasks, events = [], []
+        def launch():
+            events.append(asyncio.Event())
+            tasks.append(asyncio.create_task(fetch(events[-1])))
+        launch()
+        waiter = asyncio.create_task(events[0].wait())
+        await asyncio.wait({waiter, tasks[0]}, timeout=TTS_HEDGE_S, return_when=asyncio.FIRST_COMPLETED)
+        waiter.cancel()
+        if not events[0].is_set():
+            launch()
+        try:
+            for fut in asyncio.as_completed(tasks, timeout=TTS_TOTAL_S):
+                try:
+                    if mp3 := await fut:
+                        return mp3
+                except Exception:
+                    continue
+        finally:
+            for t in tasks:
+                t.cancel()
+        return None
+
+    try:
+        mp3 = asyncio.run(hedged())   # always called from a worker thread
+    except Exception as e:
+        mp3 = None
+        print("   [TTS] neural voice error:", _compact_error(e))
+    if not mp3:
+        print("   [TTS] neural voice unavailable, using fallback")
+        return None
+    if mp3:
+        if len(_TTS_CACHE) > 64:
+            _TTS_CACHE.clear()
+        _TTS_CACHE[key] = mp3
+    return mp3 or None
+
+
+def _mp3_to_wav(mp3: bytes) -> bytes:
+    # The ESP32 and the web app play WAV; miniaudio decodes MP3 without needing ffmpeg.
+    import miniaudio
+    snd = miniaudio.decode(mp3, output_format=miniaudio.SampleFormat.SIGNED16, nchannels=1,
+                           sample_rate=24000)   # the voices' native rate; miniaudio would upsample to 44.1k
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(snd.sample_rate)
+        w.writeframes(snd.samples.tobytes())
+    return buf.getvalue()
+
+
+def _gtts_mp3(text: str) -> bytes:
+    from gtts import gTTS
+    buf = io.BytesIO()
+    gTTS(text=text, lang="ta" if _has_tamil(text) else "en", timeout=6).write_to_fp(buf)
+    return buf.getvalue()
+
+
+def render_speech(text: str) -> tuple[bytes | None, bytes]:
+    """Synthesize a reply ONCE: (MP3 for the PC speakers, or None) and a WAV for the ESP32 / app."""
+    text = text or "Okay."
+    mp3 = _edge_mp3(text)
+    if mp3 is None and (TTS_ENGINE == "edge" or _has_tamil(text)):   # smoother than Windows; speaks Tamil
+        try:
+            mp3 = _gtts_mp3(text)
+        except Exception as e:
+            print("   [TTS] gTTS failed:", _compact_error(e))
+    if mp3:
+        try:
+            return mp3, _mp3_to_wav(mp3)
+        except Exception as e:
+            print("   [TTS] couldn't decode MP3:", _compact_error(e))
+    try:
+        return None, _sapi_wav(text)
+    except Exception as e:
+        print("   [TTS] failed:", _compact_error(e))
+        return None, _silence_wav()
+
 
 def synthesize(text: str) -> bytes:
+    return render_speech(text)[1]
+
+
+def _warm_up_tts():
+    # Importing edge-tts/miniaudio takes ~2 s and the first connection is slow; do both at startup
+    # instead of on the first reply. The phrase is cached, so it's also instant when used.
+    try:
+        render_speech("Sorry, I didn't catch that.")
+    except Exception:
+        pass
+
+
+def _sapi_wav(text: str) -> bytes:
     text = text or "Okay."
     try:
         import pythoncom, win32com.client
@@ -473,30 +606,43 @@ def synthesize(text: str) -> bytes:
         return data
 
 
-def speak_on_pc(text: str):
-    """Play the reply aloud on the PC. English → offline SAPI (fast); Tamil/other → gTTS."""
-    if not PLAY_ON_PC or not text:
+_LAST_REPLY_FILE = {"path": None}
+
+
+def play_on_pc(mp3: bytes | None, wav: bytes):
+    """Play an already-synthesized reply on the PC speakers (MP3 if we have it, else the WAV)."""
+    if not PLAY_ON_PC:
         return
     try:
-        if _has_tamil(text):
-            from gtts import gTTS
-            import ctypes
-            import uuid
-            winmm = ctypes.windll.winmm
-            winmm.mciSendStringW("close hsnd", None, 0, 0)   # release any file still playing
-            path = os.path.join(tempfile.gettempdir(), f"hermes_reply_{uuid.uuid4().hex}.mp3")
-            gTTS(text=text, lang="ta").save(path)
+        import ctypes
+        import uuid
+        import winsound
+        winmm = ctypes.windll.winmm
+        winmm.mciSendStringW("close hsnd", None, 0, 0)    # a new reply interrupts the previous one
+        winsound.PlaySound(None, winsound.SND_PURGE)
+        old = _LAST_REPLY_FILE["path"]
+        if old:
+            try:
+                os.remove(old)
+            except OSError:
+                pass
+        path = os.path.join(tempfile.gettempdir(), f"hermes_reply_{uuid.uuid4().hex}.{'mp3' if mp3 else 'wav'}")
+        with open(path, "wb") as f:
+            f.write(mp3 or wav)
+        _LAST_REPLY_FILE["path"] = path
+        if mp3:
             winmm.mciSendStringW(f'open "{path}" type mpegvideo alias hsnd', None, 0, 0)
             winmm.mciSendStringW("play hsnd", None, 0, 0)
         else:
-            import winsound
-            wav = synthesize(text)
-            path = os.path.join(tempfile.gettempdir(), "hermes_reply.wav")
-            with open(path, "wb") as f:
-                f.write(wav)
             winsound.PlaySound(path, winsound.SND_FILENAME | winsound.SND_ASYNC)
     except Exception as e:
         print("   [PC audio] could not play:", e)
+
+
+def speak_on_pc(text: str):
+    """Speak a reply aloud on the PC."""
+    if PLAY_ON_PC and text:
+        play_on_pc(*render_speech(text))
 
 
 def _silence_wav(seconds: float = 0.35, sample_rate: int = 16000) -> bytes:
@@ -514,14 +660,6 @@ def _silence_wav(seconds: float = 0.35, sample_rate: int = 16000) -> bytes:
             os.remove(tmp)
         except OSError:
             pass
-
-
-def safe_synthesize(text: str) -> bytes:
-    try:
-        return synthesize(text)
-    except Exception as e:
-        print("   [TTS] failed:", _compact_error(e))
-        return _silence_wav()
 
 
 def _ext_for(content_type: str) -> str:
@@ -545,8 +683,8 @@ async def voice(request: Request):
         reply = run_agent(heard)
         print(f"   heard: {heard!r}")
         print(f"   reply: {reply!r}")
-        wav = safe_synthesize(reply)
-        speak_on_pc(reply)          # speak it on the PC (no ESP speaker needed)
+        mp3, wav = render_speech(reply)   # synthesize once: WAV for the ESP32, MP3 for the PC
+        play_on_pc(mp3, wav)              # speak it on the PC (no ESP speaker needed)
         return wav
     wav = await asyncio.to_thread(work, audio)
     return Response(content=wav, media_type="audio/wav")
@@ -563,7 +701,8 @@ async def chat(request: Request):
     print(f"\n── /chat ── {text!r}")
     reply = await asyncio.to_thread(run_agent, text)
     print(f"   reply: {reply!r}")
-    await asyncio.to_thread(speak_on_pc, reply)   # speak it aloud on the PC
+    # Speak it on the PC in the background: the app shows the text without waiting for the voice.
+    threading.Thread(target=speak_on_pc, args=(reply,), daemon=True).start()
     return JSONResponse({"reply": reply})
 
 
@@ -577,12 +716,12 @@ async def talk(request: Request):
     def work(a, e):
         heard = transcribe(a, filename=f"speech.{e}")
         reply = run_agent(heard)
-        wav = safe_synthesize(reply)
+        mp3, wav = render_speech(reply)
+        play_on_pc(mp3, wav)              # also speak it aloud on the PC
         return heard, reply, base64.b64encode(wav).decode()
 
     heard, reply, audio_b64 = await asyncio.to_thread(work, audio, ext)
     print(f"   heard: {heard!r}  reply: {reply!r}")
-    await asyncio.to_thread(speak_on_pc, reply)   # also speak it aloud on the PC
     return JSONResponse({"heard": heard, "reply": reply, "audio_b64": audio_b64})
 
 
@@ -665,8 +804,10 @@ if __name__ == "__main__":
     print(f"  Auth token    : {'ON 🔒' if TOKEN else 'off (LAN only — set HERMES_TOKEN before exposing!)'}")
     if SP.client_id():
         print(f"  Spotify       : {'connected ✅' if SP.is_connected() else f'not linked — open http://127.0.0.1:{PORT}/spotify/login on this PC'}")
+    print(f"  Voice         : {TTS_VOICE if TTS_ENGINE == 'edge' else 'Windows (offline)'}")
     print(f"  On this LAN   : http://{ip}:{PORT}/app/   (open on your phone)")
     print(f"  ESP config.h  : BRIDGE_HOST \"{ip}\"  (or leave USE_MDNS 1)")
     print("=" * 62)
+    threading.Thread(target=_warm_up_tts, daemon=True).start()
     advertise(ip)
     uvicorn.run(app, host="0.0.0.0", port=PORT, log_level="warning")

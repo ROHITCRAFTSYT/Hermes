@@ -45,7 +45,8 @@ cheap and the AI stays as powerful as you like.
 - 💻 **Control other computers** on your network by name (via a tiny agent).
 - 🧠 **Memory** — remembers the last several turns (follow‑ups like "and the
   distance?") and long‑term facts ("remember my router is in the study").
-- 🗣️ **Bilingual** — auto English **and Tamil** (Google TTS for Tamil).
+- 🗣️ **Natural, bilingual voice** — auto English **and Tamil**, spoken with
+  human‑sounding neural voices (free, no API key).
 - 📱 **Phone/web app** — a PWA served by the brain; type or talk from any device.
 - 🔒 **Token‑secured**, LAN‑first, with optional **remote access** from anywhere.
 - 🔁 **Resilient** — auto‑discovers the brain by name (mDNS), and falls back to a
@@ -238,6 +239,12 @@ running, Hermes starts the desktop app and plays on it.
 
 ## ⚙️ Configuration reference
 
+- **Voice** — replies use free Microsoft neural voices (the ones behind Edge's
+  *Read aloud*): `TTS_VOICE` (default `en-US-AvaMultilingualNeural`) and
+  `TTS_VOICE_TA` (default `ta-IN-PallaviNeural`) in `.env`; list all voices with
+  `.venv\Scripts\edge-tts --list-voices`. Needs internet — if it's slow or down,
+  Hermes falls back to Google's voice, then the offline Windows voice
+  (`TTS_ENGINE=sapi` forces offline).
 - **`bridge/.env`** — Groq/NVIDIA keys, models, `HERMES_TOKEN`, `PLAY_ON_PC`,
   `SPOTIFY_CLIENT_ID`, `LLM_MAX_TOKENS` / `REASONING_EFFORT`.
 - **`firmware/…/config.h`** — `BRIDGE_HOST`/`BRIDGE_TOKEN`, `MAX_RECORD_SECONDS`,

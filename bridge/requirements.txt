@@ -14,5 +14,7 @@ zeroconf>=0.132
 pywin32>=306 ; sys_platform == "win32"
 pyttsx3>=2.90
 gTTS>=2.5
+edge-tts>=7.0      # natural neural voices (free, no key)
+miniaudio>=1.59    # MP3 -> WAV for the ESP32 / app, no ffmpeg needed
 Pillow>=10.0
 pychromecast>=14.0

@@ -240,14 +240,24 @@ void recordWAV(uint8_t* buf) {
   const size_t CH = 256;
   int32_t raw[CH];
   uint32_t left = TOTAL_SAMPLES, idx = 0;
+  int32_t peak = 0, rawPeak = 0; uint64_t sumSq = 0;
   while (left > 0) {
     size_t want = (left < CH ? left : CH), n = 0;
     i2s_read(I2S_MIC_PORT, raw, want*sizeof(int32_t), &n, portMAX_DELAY);
     size_t got = n / sizeof(int32_t);
-    for (size_t i=0;i<got;i++) dst[idx++] = (int16_t)(raw[i] >> 14);
+    for (size_t i=0;i<got;i++) {
+      int32_t s = raw[i] >> MIC_GAIN_SHIFT;
+      if (s > 32767) s = 32767; else if (s < -32768) s = -32768;   // clip instead of wrapping
+      dst[idx++] = (int16_t)s;
+      int32_t a = s < 0 ? -s : s;           if (a > peak) peak = a;
+      int32_t r = raw[i] < 0 ? -(raw[i]>>1) : (raw[i]>>1); if (r > rawPeak) rawPeak = r;
+      sumSq += (uint64_t)((int64_t)s * s);
+    }
     left -= got;
   }
-  Serial.printf("[Rec] %u samples\n", (unsigned)TOTAL_SAMPLES);
+  // Mic level check: speech is typically peak > 2000. Peak ~0 = mic not wired / no data.
+  Serial.printf("[Rec] %u samples, peak %d, rms %u, raw peak 0x%08X\n", (unsigned)TOTAL_SAMPLES,
+                (int)peak, (unsigned)sqrt((double)sumSq / TOTAL_SAMPLES), (unsigned)(rawPeak << 1));
 }
 
 // ── POST audio, STREAM reply straight to the speaker ────────────────────────

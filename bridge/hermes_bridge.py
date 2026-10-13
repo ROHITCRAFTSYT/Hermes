@@ -283,7 +283,7 @@ def _run_agent_locked(user_text: str) -> str:
     if not _client and not NVIDIA_API_KEY:
         detail = f" ({_client_error})" if _client_error else ""
         return "My brain isn't connected yet. Please add a Groq or NVIDIA A P I key to the dot env file." + detail
-    if not user_text:
+    if not any(c.isalnum() for c in user_text or ""):   # empty, or Whisper heard only "." on silence
         return "Sorry, I didn't catch that."
 
     low = user_text.lower().strip()

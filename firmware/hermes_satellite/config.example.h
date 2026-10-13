@@ -18,7 +18,7 @@
 
 // -- Behaviour ---------------------------------------------------------------
 #define MAX_RECORD_SECONDS   3      // classic ESP32 RAM-safe default
-#define MIC_GAIN_SHIFT       14     // 32->16 bit shift. LOWER = louder (try 11-13 if quiet)
+#define MIC_GAIN_SHIFT       15     // 32->16 bit shift. LOWER = louder (try 11-13 if quiet)
 #define BRIDGE_TIMEOUT_MS    20000  // time to allow for STT + LLM + TTS
 
 // -- ESP32-S3 pins from the schematic. The classic ESP32 sketch OVERRIDES these

@@ -22,6 +22,7 @@ import tempfile
 import threading
 import time
 import re
+from datetime import datetime
 import wave
 import sys
 from pathlib import Path
@@ -48,15 +49,17 @@ load_dotenv(_HERE / ".env")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
 NVIDIA_API_KEY = os.getenv("NVIDIA_API_KEY", "").strip()
 NVIDIA_BASE_URL = os.getenv("NVIDIA_BASE_URL", "https://integrate.api.nvidia.com/v1").rstrip("/")
-NVIDIA_LLM_MODEL = os.getenv("NVIDIA_LLM_MODEL", os.getenv("LLM_MODEL", "openai/gpt-oss-120b"))
+NVIDIA_LLM_MODEL = os.getenv("NVIDIA_LLM_MODEL", "nvidia/nemotron-3-super-120b-a12b")
 STT_MODEL = os.getenv("STT_MODEL", "whisper-large-v3-turbo")
 LLM_MODEL = os.getenv("LLM_MODEL", "llama-3.3-70b-versatile")
 PORT = int(os.getenv("PORT", "8787"))
 NAME = os.getenv("ASSISTANT_NAME", "Hermes")
 TOKEN = os.getenv("HERMES_TOKEN", "").strip()
 PLAY_ON_PC = os.getenv("PLAY_ON_PC", "1") == "1"   # speak replies on the PC speakers (no ESP speaker needed)
-LLM_MAX_TOKENS = int(os.getenv("LLM_MAX_TOKENS", "220"))
+LLM_MAX_TOKENS = int(os.getenv("LLM_MAX_TOKENS", "1024"))   # includes reasoning tokens on gpt-oss
+REASONING_EFFORT = os.getenv("REASONING_EFFORT", "low")       # gpt-oss only: low = fast, short thinking
 LLM_RATE_LIMIT_RETRIES = int(os.getenv("LLM_RATE_LIMIT_RETRIES", "2"))
+AGENT_DEADLINE_S = float(os.getenv("AGENT_DEADLINE_S", "12"))   # then answer with what we have (ESP waits 30 s)
 
 SYSTEM_PROMPT = (
     f"You are {NAME}, a friendly voice assistant that runs the user's smart home, "
@@ -68,6 +71,9 @@ SYSTEM_PROMPT = (
     "(the user will say 'on the other laptop', 'on <name>'s laptop', etc.), use remote_pc "
     "with that computer's name. NEVER say you opened or did something unless you actually called the "
     "tool for it. After the tool runs, confirm in one short sentence. "
+    "When the user asks a question, just speak the answer from web_search; do not open websites "
+    "or apps unless they asked you to open, show, or play something. If none of your tools can do "
+    "what they asked, say so briefly in one sentence instead of replying 'Okay'. "
     "Your replies may be read ALOUD, so keep them short, natural, and conversational — "
     "usually one or two sentences, no markdown, no lists, no emoji. If a tool reports a "
     "device isn't set up, tell the user plainly what to configure. "
@@ -77,9 +83,40 @@ SYSTEM_PROMPT = (
     "in natural Tamil using Tamil script (not transliteration)."
 )
 
+FRESHNESS_RULE = (
+    "Your built-in knowledge is out of date and may be years old. For anything that can change "
+    "over time — who currently holds a job or office (presidents, prime ministers, chief ministers, "
+    "CEOs), news, elections, prices, scores, weather, releases, or anything 'current', 'latest' or "
+    "'now' — ALWAYS call web_search first and answer only from its results, even if you think you "
+    "know. If the results disagree with your memory, the results are right."
+)
+
+# Factual questions get a forced web_search on the first step so the model can't answer from stale memory.
+_FACT_QUESTION = re.compile(
+    r"^\s*(who|whom|whose|what|what's|whats|when|where|which|"
+    r"how (much|many|old|far|long|big|tall|is|are|was|did|does|do))\b"
+    r"|\b(latest|current|currently|right now|news|price of|score|weather|election)\b", re.I)
+_NO_SEARCH = re.compile(
+    r"\b(what time|the time|time is it|the date|what day|your name|who are you|what can you do)\b", re.I)
+_COMMAND = re.compile(
+    r"^\s*(open|play|close|launch|start|turn|switch|set|pause|stop|resume|lock|mute|unmute|"
+    r"volume|take|show|go to|cast|remember)\b", re.I)
+
+
+def _needs_search(text: str) -> bool:
+    return bool(_FACT_QUESTION.search(text)) and not _NO_SEARCH.search(text) \
+        and not _COMMAND.match(text)
+
+
+def _system_prompt(user_text: str) -> str:
+    now = datetime.now()
+    return (f"{SYSTEM_PROMPT} Today is {now:%A, %d %B %Y} and the local time is {now:%I:%M %p}. "
+            f"{FRESHNESS_RULE} {_language_hint(user_text)}")
+
 try:
     from groq import Groq
-    _client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
+    # No silent SDK retries: on a rate limit we'd rather switch to NVIDIA than stall the ESP32.
+    _client = Groq(api_key=GROQ_API_KEY, max_retries=0) if GROQ_API_KEY else None
     _client_error = ""
 except Exception as e:
     _client = None
@@ -184,13 +221,27 @@ def _is_rate_limit(exc: Exception) -> bool:
     return "rate_limit" in text or "rate limit" in text or _retry_delay_seconds(exc) is not None
 
 
-def _groq_chat(messages: list[dict]) -> dict:
+def _tool_args(force: str | None) -> dict:
+    # force=None: model may pick a tool; a tool name: must call it; "none": no tools offered at all
+    # (some providers ignore tool_choice="none", so the tools are left out entirely).
+    if force == "none":
+        return {}
+    choice = {"type": "function", "function": {"name": force}} if force else "auto"
+    return {"tools": T.TOOLS_SPEC, "tool_choice": choice}
+
+
+def _reasoning_args(model: str) -> dict:
+    # gpt-oss thinks before answering; unchecked, the thinking eats the whole token budget.
+    return {"reasoning_effort": REASONING_EFFORT} if "gpt-oss" in model.lower() and REASONING_EFFORT else {}
+
+
+def _groq_chat(messages: list[dict], force: str | None = None) -> dict:
     if not _client:
         raise RuntimeError(_client_error or "Groq client is not configured")
     resp = _client.chat.completions.create(
         model=LLM_MODEL, messages=messages,
-        tools=T.TOOLS_SPEC, tool_choice="auto",
-        temperature=0.4, max_tokens=LLM_MAX_TOKENS,
+        **_tool_args(force),
+        temperature=0.4, max_tokens=LLM_MAX_TOKENS, **_reasoning_args(LLM_MODEL),
     )
     msg = resp.choices[0].message
     return {
@@ -204,18 +255,18 @@ def _groq_chat(messages: list[dict]) -> dict:
     }
 
 
-def _nvidia_chat(messages: list[dict]) -> dict:
+def _nvidia_chat(messages: list[dict], force: str | None = None) -> dict:
     if not NVIDIA_API_KEY:
         raise RuntimeError("NVIDIA API key is not configured")
     import httpx
     payload = {
         "model": NVIDIA_LLM_MODEL,
         "messages": messages,
-        "tools": T.TOOLS_SPEC,
-        "tool_choice": "auto",
+        **_tool_args(force),
         "temperature": 0.4,
         "max_tokens": LLM_MAX_TOKENS,
         "stream": False,
+        **_reasoning_args(NVIDIA_LLM_MODEL),
     }
     r = httpx.post(
         NVIDIA_BASE_URL + "/chat/completions",
@@ -241,26 +292,26 @@ def _nvidia_chat(messages: list[dict]) -> dict:
     return {"provider": "nvidia", "content": msg.get("content") or "", "tool_calls": calls}
 
 
-def _chat_completion(messages: list[dict]) -> dict:
+def _chat_completion(messages: list[dict], force: str | None = None) -> dict:
     last_error: Exception | None = None
     if _client:
         for attempt in range(LLM_RATE_LIMIT_RETRIES + 1):
             try:
-                return _groq_chat(messages)
+                return _groq_chat(messages, force)
             except Exception as e:
                 last_error = e
+                if _is_rate_limit(e) and NVIDIA_API_KEY:
+                    print("   [LLM] Groq rate-limited; using NVIDIA fallback.")
+                    break
                 delay = _retry_delay_seconds(e)
                 if delay is not None and delay <= 8 and attempt < LLM_RATE_LIMIT_RETRIES:
                     time.sleep(max(0.5, delay + 0.25))
                     continue
-                if _is_rate_limit(e) and NVIDIA_API_KEY:
-                    print("   [LLM] Groq rate-limited; trying NVIDIA fallback.")
-                    break
                 raise
 
     if NVIDIA_API_KEY:
         try:
-            return _nvidia_chat(messages)
+            return _nvidia_chat(messages, force)
         except Exception as e:
             if last_error:
                 raise RuntimeError(f"Groq failed: {_compact_error(last_error)}; NVIDIA failed: {_compact_error(e)}")
@@ -293,12 +344,22 @@ def _run_agent_locked(user_text: str) -> str:
         return "Okay, I've cleared our conversation. Starting fresh."
 
     # System prompt + recent history + the new turn → this gives it context.
-    messages = [{"role": "system", "content": SYSTEM_PROMPT + " " + _language_hint(user_text)}] + CONVO[-_CONVO_MAX:] + \
+    messages = [{"role": "system", "content": _system_prompt(user_text)}] + CONVO[-_CONVO_MAX:] + \
                [{"role": "user", "content": user_text}]
     reply = "Okay."
-    for _ in range(6):
+    search_first = _needs_search(user_text)
+    started = time.monotonic()
+    for step in range(6):
+        force = "web_search" if step == 0 and search_first else None
+        if step and time.monotonic() - started > AGENT_DEADLINE_S:
+            force = "none"   # out of time: no more tools, answer from what we have
         try:
-            msg = _chat_completion(messages)
+            try:
+                msg = _chat_completion(messages, force)
+            except Exception as e:
+                if not force or _is_rate_limit(e):
+                    raise
+                msg = _chat_completion(messages)   # provider refused a forced tool call; let the model choose
         except Exception as e:
             print("   [LLM] failed:", _compact_error(e))
             reply = _model_error_reply(e)
@@ -334,6 +395,7 @@ def _run_agent_locked(user_text: str) -> str:
     CONVO.append({"role": "assistant", "content": reply})
     CONVO = CONVO[-_CONVO_MAX:]
     _save_convo()
+    reply = reply.replace(" ", " ").replace(" ", " ")   # model emits narrow no-break spaces
     return re.sub(r"(?<=[a-zA-Z0-9])\.(?=[A-Z])", ". ", reply)
 
 

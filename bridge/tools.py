@@ -12,6 +12,7 @@ import re
 import json
 import ctypes
 import subprocess
+import time
 import webbrowser
 from urllib.parse import quote
 from pathlib import Path
@@ -208,17 +209,45 @@ def pc_action(action: str, app: str | None = None, repeat: int = 1) -> str:
 
 # ── The open web ─────────────────────────────────────────────────────────────
 
+SEARCH_TIMEOUT_S = 6
+
+
 def web_search(query: str, max_results: int = 5) -> str:
     try:
         try:
             from ddgs import DDGS
         except ImportError:
             from duckduckgo_search import DDGS  # older package name
-        out = []
-        with DDGS() as d:
-            for r in d.text(query, max_results=max_results):
-                out.append(f"- {r.get('title','')}: {r.get('body','')} ({r.get('href','')})")
-        return "\n".join(out) if out else "No results found."
+        from concurrent.futures import ThreadPoolExecutor
+
+        def news():
+            try:
+                with DDGS() as d:
+                    return [f"- [news {str(r.get('date',''))[:10]}] {r.get('title','')}: {r.get('body','')}"
+                            for r in d.news(query, max_results=3)]
+            except Exception:
+                return []
+
+        def text():
+            with DDGS() as d:
+                return [f"- {r.get('title','')}: {r.get('body','')} ({r.get('href','')})"
+                        for r in d.text(query, max_results=max_results)]
+
+        # Both lookups run at once, capped so a slow search engine can't stall the ESP32's
+        # 20 s reply window. Dated news goes first so the model sees what's current.
+        pool = ThreadPoolExecutor(2)
+        futures = [pool.submit(news), pool.submit(text)]
+        deadline = time.monotonic() + SEARCH_TIMEOUT_S
+        out, errors = [], []
+        for f in futures:
+            try:
+                out += f.result(timeout=max(0.1, deadline - time.monotonic()))
+            except Exception as e:
+                errors.append(e)
+        pool.shutdown(wait=False, cancel_futures=True)
+        if out:
+            return "\n".join(out)
+        return f"Web search failed ({errors[-1] or 'timed out'})." if errors else "No results found."
     except Exception as e:
         return f"Web search failed ({e})."
 
@@ -569,7 +598,7 @@ TOOLS_SPEC = [
             "query": {"type": "string"}}, "required": ["query"]}}},
     {"type": "function", "function": {
         "name": "web_search",
-        "description": "Silently search the web and READ results to ANSWER a question (facts, prices, news) out loud. Does NOT open a browser window. Use this when the user asks a question, not when they say 'open' or 'browse'.",
+        "description": "Silently search the web and READ results to ANSWER a question (facts, prices, news) out loud. Does NOT open a browser window. Use this when the user asks a question, not when they say 'open' or 'browse'. Your own knowledge is out of date: ALWAYS use this for anything that can change (who holds an office or job, news, elections, prices, scores, weather, anything 'current' or 'latest') and trust its results over your memory.",
         "parameters": {"type": "object", "properties": {
             "query": {"type": "string"}}, "required": ["query"]}}},
     {"type": "function", "function": {

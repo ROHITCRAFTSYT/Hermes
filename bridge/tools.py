@@ -356,6 +356,12 @@ def crypto_price(coin: str) -> str:
         return web_search(f"{coin} crypto price today")
 
 
+def timer(action: str, kind: str = "", label: str = "", hours: float = 0, minutes: float = 0,
+          seconds: float = 0, at: str = "", repeat: str = "", duration: str = "") -> str:
+    import timers as tm
+    return tm.handle(action, kind, label, hours, minutes, seconds, at, repeat, duration)
+
+
 def spotify(action: str, query: str = "", level: int | None = None) -> str:
     import spotify as sp
     return sp.control(action, query, level)
@@ -876,6 +882,17 @@ TOOLS_SPEC = [
         "parameters": {"type": "object", "properties": {
             "coin": {"type": "string", "description": "coin name or ticker, e.g. 'solana', 'BTC', 'trump'"}}, "required": ["coin"]}}},
     {"type": "function", "function": {
+        "name": "timer",
+        "description": "Timers, reminders and alarms: 'set a pasta timer for 8 minutes', 'remind me in 20 minutes to check the oven', 'remind me at 6 pm to call mom', 'wake me up at 7 every day', 'how long is left on my timer', 'what reminders do I have', 'cancel the pasta timer'. For a delay put the numbers the user said in hours/minutes/seconds (don't convert units). For a clock time use 'at', e.g. '18:00', '6:30 pm', 'tomorrow 9:00', '2026-10-20 09:00'.",
+        "parameters": {"type": "object", "properties": {
+            "action": {"type": "string", "description": "set, list, or cancel"},
+            "kind": {"type": "string", "description": "timer (counts down), reminder (to do something), or alarm (wake up)"},
+            "label": {"type": "string", "description": "what it's for, e.g. 'pasta' or 'call mom'; for cancel/list, which one"},
+            "hours": {"type": "number"}, "minutes": {"type": "number"}, "seconds": {"type": "number"},
+            "at": {"type": "string", "description": "clock time, e.g. '18:00', '6 pm', 'tomorrow 7:00'"},
+            "repeat": {"type": "string", "description": "'daily' for every day, else leave empty"}},
+            "required": ["action", "kind"]}}},
+    {"type": "function", "function": {
         "name": "spotify",
         "description": "Play music on Spotify and control it. Use this whenever the user asks to play a song, artist, album or playlist (on Spotify or just 'play <song>'). actions: play (with 'query' = song/artist name; prefix with 'album ', 'artist ' or 'playlist ' for those), resume, pause, next, previous, volume (with 'level' 0-100), now_playing.",
         "parameters": {"type": "object", "properties": {
@@ -956,6 +973,7 @@ _DISPATCH = {
     "web_search": web_search,
     "crypto_price": crypto_price,
     "spotify": spotify,
+    "timer": timer,
     "read_page": read_page,
     "remember": remember,
     "close_app": close_app,

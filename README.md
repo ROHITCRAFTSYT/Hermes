@@ -37,6 +37,9 @@ cheap and the AI stays as powerful as you like.
 - 🖥️ **PC & media control** — open/close apps, switch windows, play/pause,
   volume, screenshots, lock the PC.
 - 🎵 **Spotify** — "play Over My Dead Body" plays that exact song (Premium, one‑time login).
+- ⏰ **Timers, reminders & alarms** — "set a pasta timer for 8 minutes", "remind me at
+  6 pm to call mom", "wake me up at 7 every day". A chime plus a spoken message on the
+  PC; they survive restarts.
 - 📈 **Always current** — knows today's date, searches the web before answering
   anything that changes, and pulls live crypto prices from CoinGecko.
 - 🏠 **Smart‑home control** — Tuya bulbs/plugs, custom ESP relay nodes (MQTT),
@@ -110,6 +113,7 @@ HermesAgent/
 │  ├─ hermes_bridge.py            ← STT → agent loop → TTS + web/app server
 │  ├─ tools.py                    ← every tool: web, PC, smart home, network…
 │  ├─ spotify.py                  ← Spotify login (PKCE) + playback
+│  ├─ timers.py                   ← timers, reminders & alarms (saved in timers.json)
 │  ├─ requirements.txt
 │  ├─ .env.example                ← copy to .env, add your Groq key + token
 │  ├─ devices.example.json        ← copy to devices.json, add your devices
@@ -225,6 +229,7 @@ running, Hermes starts the desktop app and plays on it.
 | PC & media | "pause" · "volume up" · "take a screenshot" · "lock the PC" |
 | Spotify | "play Over My Dead Body" · "play artist Anirudh" · "play playlist Today's Top Hits" · "next song" · "what's playing?" |
 | Live prices | "what's the price of Bitcoin?" · "how much is Solana?" |
+| Timers & reminders | "set a timer for 10 minutes" · "remind me in 20 minutes to check the oven" · "remind me at 6 pm to call mom" · "wake me up at 7 every day" · "how long is left on my timer?" · "cancel the pasta timer" |
 | Windows | "close Chrome" · "switch to Word" |
 | Network | "scan the network" · "wake my desktop" · "is the printer online?" |
 | Smart home | "turn on the bedroom light" · "turn off the fan plug" |

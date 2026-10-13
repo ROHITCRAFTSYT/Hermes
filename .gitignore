@@ -6,6 +6,7 @@ bridge/devices.json
 bridge/conversation.json
 bridge/memory.json
 bridge/spotify_token.json
+bridge/timers.json
 
 # ── Python ──────────────────────────────────────────────────────────────────
 **/.venv/

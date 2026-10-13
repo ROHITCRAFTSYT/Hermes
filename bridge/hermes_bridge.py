@@ -37,6 +37,7 @@ import uvicorn
 
 import tools as T
 import spotify as SP
+import timers as TM
 
 for _stream in (sys.stdout, sys.stderr):
     try:
@@ -118,8 +119,13 @@ _MUSIC_QUESTION = re.compile(r"\b(spotify|what'?s playing|what is playing|this s
 _PLAY_MUSIC = re.compile(r"^\s*(please\s+|can you\s+|hey\s+\w+,?\s+)?play\b(?!.*\b(youtube|video)s?\b)", re.I)
 
 
+_TIMER_TALK = re.compile(r"\b(timers?|remind(ers?)?|alarms?|wake me)\b", re.I)
+
+
 def _first_tool(text: str) -> str | None:
     """Tool the model must call first: fresh data for questions, Spotify for 'play <song>'."""
+    if _TIMER_TALK.search(text):
+        return "timer"
     if _PLAY_MUSIC.search(text):
         return "spotify"
     if _COMMAND.match(text) or _NO_SEARCH.search(text):
@@ -645,6 +651,21 @@ def speak_on_pc(text: str):
         play_on_pc(*render_speech(text))
 
 
+def announce_timer(text: str, kind: str):
+    """A timer/reminder/alarm is due: chime (three times for alarms), then say it."""
+    print(f"\n── {kind} ── {text}")
+    if not PLAY_ON_PC:
+        return
+    try:
+        import winsound
+        mp3, wav = render_speech(text)   # synthesize during the chime's lead-in, not after it
+        for _ in range(3 if kind == "alarm" else 1):
+            winsound.PlaySound(TM.chime_path(), winsound.SND_FILENAME)
+        play_on_pc(mp3, wav)
+    except Exception as e:
+        print("   [timer] couldn't announce:", e)
+
+
 def _silence_wav(seconds: float = 0.35, sample_rate: int = 16000) -> bytes:
     tmp = tempfile.mktemp(suffix=".wav")
     try:
@@ -809,5 +830,6 @@ if __name__ == "__main__":
     print(f"  ESP config.h  : BRIDGE_HOST \"{ip}\"  (or leave USE_MDNS 1)")
     print("=" * 62)
     threading.Thread(target=_warm_up_tts, daemon=True).start()
+    TM.start(announce_timer)   # timers/reminders/alarms, including any that came due while off
     advertise(ip)
     uvicorn.run(app, host="0.0.0.0", port=PORT, log_level="warning")

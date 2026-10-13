@@ -189,10 +189,11 @@ your home, see [`REMOTE_ACCESS.md`](REMOTE_ACCESS.md).
 
 ### 4 — Controlling another computer (optional)
 
-On the *other* PC, run **`agent/install_agent.bat`** once (needs Python). It
+On the *other* PC, run **`agent/install_agent.bat`** once (needs Python). It asks
+for your brain's `HERMES_TOKEN` (the agent refuses every command without it),
 installs a tiny agent that auto‑starts at login, and prints that PC's IP. Add it
-to `bridge/devices.json` under `computers`, then say *"open notepad on the other
-laptop"*.
+to `bridge/devices.json` under `computers` (with the same token), then say
+*"open notepad on the other laptop"*.
 
 ### 5 — Spotify playback (optional, needs Premium)
 
@@ -246,7 +247,11 @@ running, Hermes starts the desktop app and plays on it.
   - `devices` — `wol` (wake a PC), `http` (ESP relay `/on`,`/off`), `ping`
   - `computers` — other PCs running the agent
   - `apps` — custom app launch paths
-  - Home Assistant: set `HA_URL` + `HA_TOKEN` (env) → control everything HA finds.
+  - Home Assistant: set `HA_URL` + `HA_TOKEN` (env) → control everything HA finds
+    (lights, switches, AC, garage doors, locks, TVs, sensors). Unlocking a lock by
+    voice is off unless you also set `HA_ALLOW_UNLOCK=1`.
+  - Hermes is told your configured device names on every request, so say them
+    as written here (e.g. *"turn on the fan node"*).
 
 ---
 

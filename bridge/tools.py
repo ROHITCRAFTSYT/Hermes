@@ -33,49 +33,106 @@ def _cfg() -> dict:
 
 # ── Smart bulbs & plugs (Tuya / Smart Life) ──────────────────────────────────
 
-def _tuya(entry: dict):
+_ON_WORDS = ("on", "turn on", "turn_on", "switch on", "power on", "open", "start", "1", "true", "enable")
+_OFF_WORDS = ("off", "turn off", "turn_off", "switch off", "power off", "close", "stop", "0", "false", "disable")
+_FILLER = ("the", "my", "light", "lights", "lamp", "plug", "socket", "switch", "device")
+
+
+def _match(name: str, registry: dict, partial: bool = True) -> str | None:
+    """Find a configured name: exact, then without filler ("porch light" -> "porch"), then (if allowed)
+    a unique key that STARTS with what was said ("living" -> "living lamp"). Never the reverse:
+    "bedroom AC" must not match the "bedroom" light."""
+    keys = {k.lower(): k for k in registry}
+    n = " ".join((name or "").lower().split())
+    if n in keys:
+        return keys[n]
+    bare = " ".join(w for w in n.split() if w not in _FILLER)
+    if bare in keys:
+        return keys[bare]
+    if not partial or not bare:
+        return None
+    hits = [k for lk, k in keys.items() if lk.startswith(bare + " ")]
+    return hits[0] if len(hits) == 1 else None
+
+
+def _tuya(entry: dict, bulb: bool = False):
     import tinytuya
-    dev = tinytuya.Device(entry["id"], entry["ip"], entry["key"])
+    dev = (tinytuya.BulbDevice if bulb else tinytuya.Device)(entry["id"], entry["ip"], entry["key"])
     dev.set_version(float(entry.get("version", "3.4")))
     dev.set_socketTimeout(3)
     return dev
 
 
+def _tuya_check(resp):
+    # tinytuya reports failures by RETURNING {"Error": ..., "Err": ...} rather than raising.
+    if isinstance(resp, dict) and resp.get("Error"):
+        raise ConnectionError(resp["Error"])
+    return resp
+
+
+def _tuya_switch(entry: dict, label: str, on: bool, brightness: int | None = None, bulb: bool = False) -> str:
+    kind = "light" if bulb else "plug"
+    try:
+        dev = _tuya(entry, bulb)
+        if bulb:
+            _tuya_check(dev.turn_on() if on else dev.turn_off())
+            if on and brightness is not None:
+                _tuya_check(dev.set_brightness_percentage(max(1, min(100, int(brightness)))))
+        else:
+            _tuya_check(dev.set_status(bool(on), 1))
+        extra = f" at {brightness}%" if (on and brightness is not None) else ""
+        return f"{label} {kind} turned {'on' if on else 'off'}{extra}."
+    except Exception as e:
+        return f"Couldn't reach the {label} {kind} ({e}). Check it's on the same Wi-Fi and the local key is right."
+
+
+def _tuya_status(entry: dict, label: str) -> str:
+    try:
+        dps = _tuya_check(_tuya(entry).status()).get("dps", {})
+        state = dps.get("1", dps.get("20"))   # switch DP: 1 on plugs, 20 on most bulbs
+        return f"{label} is {'on' if state else 'off'}." if state is not None else f"{label} is reachable."
+    except Exception as e:
+        return f"Couldn't reach {label} ({e})."
+
+
 def control_light(name: str, on: bool = True, brightness: int | None = None) -> str:
     lights = _cfg().get("lights", {})
-    if name not in lights:
-        have = ", ".join(lights) or "none configured"
-        return f"No light called '{name}'. Configured lights: {have}."
-    try:
-        import tinytuya
-        entry = lights[name]
-        bulb = tinytuya.BulbDevice(entry["id"], entry["ip"], entry["key"])
-        bulb.set_version(float(entry.get("version", "3.4")))
-        bulb.set_socketTimeout(3)
-        if on:
-            bulb.turn_on()
-            if brightness is not None:
-                bulb.set_brightness_percentage(max(1, min(100, int(brightness))))
-        else:
-            bulb.turn_off()
-        state = "on" if on else "off"
-        extra = f" at {brightness}%" if (on and brightness is not None) else ""
-        return f"{name} light turned {state}{extra}."
-    except Exception as e:
-        return f"Couldn't reach the {name} light ({e}). Check it's on the same Wi-Fi and the local key is right."
+    key = _match(name, lights)
+    if not key:
+        return _elsewhere(name, "on" if on else "off", brightness, kind="light") or \
+            f"No light called '{name}'. Configured lights: {', '.join(lights) or 'none configured'}."
+    return _tuya_switch(lights[key], key, on, brightness, bulb=True)
 
 
 def control_plug(name: str, on: bool = True) -> str:
     plugs = _cfg().get("plugs", {})
-    if name not in plugs:
-        have = ", ".join(plugs) or "none configured"
-        return f"No plug called '{name}'. Configured plugs: {have}."
-    try:
-        dev = _tuya(plugs[name])
-        dev.set_status(bool(on), 1)
-        return f"{name} plug turned {'on' if on else 'off'}."
-    except Exception as e:
-        return f"Couldn't reach the {name} plug ({e})."
+    key = _match(name, plugs)
+    if not key:
+        return _elsewhere(name, "on" if on else "off", kind="plug") or \
+            f"No plug called '{name}'. Configured plugs: {', '.join(plugs) or 'none configured'}."
+    return _tuya_switch(plugs[key], key, on)
+
+
+# Which Home Assistant domains a wrong-tool fallback may reach: a "light" request must never
+# open a garage door just because the names overlap.
+_FALLBACK_DOMAINS = {"light": ("light", "switch"), "plug": ("switch", "fan", "light"),
+                     "device": ("light", "switch", "fan", "climate", "media_player", "cover", "lock")}
+
+
+def _elsewhere(name: str, command: str, brightness: int | None = None, kind: str = "device") -> str | None:
+    """The model picked the wrong tool for this device name — look it up in the other registries."""
+    cfg = _cfg()
+    on = command in _ON_WORDS
+    for partial in (False, True):   # an exact name anywhere beats a partial one somewhere else
+        if key := _match(name, cfg.get("lights", {}), partial):
+            return _tuya_switch(cfg["lights"][key], key, on, brightness, bulb=True)
+        if key := _match(name, cfg.get("plugs", {}), partial):
+            return _tuya_switch(cfg["plugs"][key], key, on)
+        if key := _match(name, cfg.get("devices", {}), partial):
+            return _device(key, cfg["devices"][key], command)
+        if not partial and (ent := _ha_find(name, _FALLBACK_DOMAINS[kind])):
+            return _ha_call(ent, command)
+    return None
 
 
 # ── Custom ESP32 / ESP8266 nodes over MQTT ───────────────────────────────────
@@ -246,7 +303,9 @@ def web_search(query: str, max_results: int = 5) -> str:
                 errors.append(e)
         pool.shutdown(wait=False, cancel_futures=True)
         if out:
-            return "\n".join(out)
+            # Said right next to the data: small models otherwise fall back on stale memory.
+            return (f"Live search results for '{query}'. Answer ONLY from these — if they name a "
+                    "person, price or date, use it even if your memory disagrees:\n" + "\n".join(out))
         return f"Web search failed ({errors[-1] or 'timed out'})." if errors else "No results found."
     except Exception as e:
         return f"Web search failed ({e})."
@@ -336,10 +395,29 @@ def remember(operation: str, key: str = "", value: str = "") -> str:
         _MEM_PATH.write_text(json.dumps(data, indent=2), encoding="utf-8")
         return f"Noted: {key} = {value}."
     if op == "get":
-        return f"{key}: {data.get(key, 'nothing stored')}."
+        # The model rarely repeats the exact key it saved under ("car keys" vs "car_keys_location").
+        def norm(s):
+            return " ".join(re.sub(r"[_\-]+", " ", (s or "").lower()).split())
+        want = norm(key)
+        hits = {k: v for k, v in data.items() if want and (want in norm(k) or norm(k) in want)}
+        if not hits:
+            words = [w for w in want.split() if len(w) > 2]
+            hits = {k: v for k, v in data.items() if words and any(w in norm(k) or w in norm(v) for w in words)}
+        if not hits:
+            return f"{key}: nothing stored."
+        return "; ".join(f"{k.replace('_', ' ')}: {v}" for k, v in hits.items()) + "."
     if op == "list":
         return "I remember: " + (", ".join(data) if data else "nothing yet") + "."
     return "Memory op must be set, get, or list."
+
+
+def memory_facts() -> str:
+    """Remembered facts for the system prompt, so "where are my keys?" needs no tool call."""
+    data = _mem()
+    if not data:
+        return ""
+    facts = "; ".join(f"{k.replace('_', ' ')}: {v}" for k, v in list(data.items())[-30:])
+    return "Facts the user asked you to remember: " + facts[:1500] + "."
 
 
 # ── Windows: close, switch, screenshot ───────────────────────────────────────
@@ -485,28 +563,39 @@ def control_device(name: str, command: str = "status") -> str:
     Each device has a type: wol (wake a PC), http (call a URL, e.g. an ESP relay),
     light/plug (Tuya), mqtt (a custom ESP node), or ping."""
     reg = _cfg().get("devices", {})
-    dev = reg.get((name or "").lower().strip())
-    if not dev:
+    cmd = (command or "status").lower().strip()
+    key = _match(name, reg)
+    if not key:
+        found = _elsewhere(name, cmd)
+        if found:
+            return found
         have = ", ".join(reg) if reg else "none configured yet"
         return (f"I don't have a device named '{name}'. Known devices: {have}. "
                 f"Say 'scan the network' to find devices, then add it to devices.json.")
+    return _device(key, reg[key], cmd)
+
+
+def _device(name: str, dev: dict, cmd: str) -> str:
     typ = dev.get("type", "")
-    cmd = (command or "status").lower().strip()
-    on = cmd in ("on", "turn on", "open", "start", "1", "true", "enable")
+    on = cmd in _ON_WORDS
     try:
         if typ == "wol":
             return _wake_on_lan(dev["mac"], name)
         if typ == "http":
             import httpx
-            url = (dev.get("commands", {}) or {}).get(cmd) or dev.get("url", "")
+            cmds = dev.get("commands", {}) or {}
+            canon = "on" if cmd in _ON_WORDS else "off" if cmd in _OFF_WORDS else cmd   # "turn on" -> "on"
+            url = cmds.get(cmd) or cmds.get(canon) or dev.get("url", "")
             if not url:
                 return f"No URL set for '{cmd}' on {name}."
-            httpx.get(url, timeout=5)
+            r = httpx.get(url, timeout=5)
+            if r.status_code >= 400:
+                return f"{name} answered with an error ({r.status_code})."
             return f"Sent '{cmd}' to {name}."
-        if typ == "light":
-            return control_light(name, on)
-        if typ == "plug":
-            return control_plug(name, on)
+        if typ in ("light", "plug"):   # Tuya entries in the devices registry carry their own id/ip/key
+            if cmd == "status":
+                return _tuya_status(dev, name)
+            return _tuya_switch(dev, name, on, bulb=(typ == "light"))
         if typ == "mqtt":
             return mqtt_command(dev.get("node", name), cmd)
         if typ == "ping" or cmd == "status":
@@ -601,48 +690,143 @@ def _ha():
     return os.environ.get("HA_URL", "").rstrip("/"), os.environ.get("HA_TOKEN", "")
 
 
-def ha_list() -> str:
-    """List the smart devices Home Assistant has discovered."""
+_HA_CONTROLLABLE = ("light", "switch", "fan", "media_player", "climate", "cover", "lock", "scene", "script")
+_HA_CACHE = {"at": 0.0, "states": None}
+
+# Spoken action -> HA service, per domain. Anything not listed falls back to the generic map.
+_HA_SERVICES = {
+    "cover": {"on": "open_cover", "open": "open_cover", "off": "close_cover", "close": "close_cover",
+              "stop": "stop_cover", "toggle": "toggle"},
+    "lock": {"lock": "lock", "on": "lock", "close": "lock", "unlock": "unlock"},
+    "media_player": {"play": "media_play", "pause": "media_pause", "next": "media_next_track",
+                     "previous": "media_previous_track", "volume_up": "volume_up", "volume_down": "volume_down"},
+    "scene": {"on": "turn_on", "activate": "turn_on", "run": "turn_on"},
+    "script": {"on": "turn_on", "run": "turn_on", "start": "turn_on"},
+}
+_HA_GENERIC = {"on": "turn_on", "turn_on": "turn_on", "open": "turn_on", "start": "turn_on", "enable": "turn_on",
+               "off": "turn_off", "turn_off": "turn_off", "close": "turn_off", "stop": "turn_off",
+               "disable": "turn_off", "toggle": "toggle"}
+_HA_DONE = {"turn_on": "turned on", "turn_off": "turned off", "toggle": "toggled", "open_cover": "opening",
+            "close_cover": "closing", "stop_cover": "stopped", "lock": "locked", "unlock": "unlocked",
+            "media_play": "playing", "media_pause": "paused"}
+
+
+def _ha_states(max_age: float = 60, timeout: float = 8) -> list | None:
+    """Home Assistant's entity list, cached briefly (it's also used to build every prompt)."""
     url, tok = _ha()
     if not url or not tok:
-        return ("Home Assistant isn't linked yet. Once you install it and set HA_URL and "
-                "HA_TOKEN in .env, it auto-discovers your devices and I control them all.")
+        return None
+    if time.time() - _HA_CACHE["at"] < max_age:
+        return _HA_CACHE["states"]
     try:
         import httpx
-        states = httpx.get(url + "/api/states", headers={"Authorization": f"Bearer {tok}"}, timeout=8).json()
-        keep = ("light", "switch", "fan", "media_player", "climate", "cover", "lock")
-        names = [s["attributes"].get("friendly_name") for s in states
-                 if s["entity_id"].split(".")[0] in keep and s["attributes"].get("friendly_name")]
-        return "Home Assistant devices: " + (", ".join(names[:40]) if names else "none found.")
+        states = httpx.get(url + "/api/states", headers={"Authorization": f"Bearer {tok}"}, timeout=timeout).json()
+    except Exception:
+        states = None   # cache the failure too, so a down HA doesn't add a delay to every request
+    _HA_CACHE.update(at=time.time(), states=states)
+    return states
+
+
+_HA_SENSITIVE = ("cover", "lock")   # garage doors, gates, door locks: never matched on a partial name
+
+
+def _ha_find(name: str, domains: tuple | None = None) -> dict | None:
+    states = [s for s in (_ha_states() or []) if not domains or s["entity_id"].split(".")[0] in domains]
+    n = " ".join((name or "").lower().split())
+    bare = " ".join(w for w in n.split() if w not in ("the", "my"))
+    def fn(s):
+        return (s.get("attributes", {}).get("friendly_name") or "").lower()
+    def safe(s):
+        return s["entity_id"].split(".")[0] not in _HA_SENSITIVE
+    for test in (lambda s: n in (fn(s), s["entity_id"]), lambda s: fn(s) == bare,
+                 lambda s: bare and safe(s) and fn(s).startswith(bare),
+                 lambda s: bare and safe(s) and bare in fn(s)):
+        hits = [s for s in states if test(s)]
+        if hits:   # prefer things that can be controlled over sensors with similar names
+            return sorted(hits, key=lambda s: s["entity_id"].split(".")[0] not in _HA_CONTROLLABLE)[0]
+    return None
+
+
+def _ha_call(ent: dict, action: str) -> str:
+    url, tok = _ha()
+    eid = ent["entity_id"]
+    domain = eid.split(".")[0]
+    label = ent.get("attributes", {}).get("friendly_name") or eid
+    a = (action or "toggle").lower().strip().replace(" ", "_")
+    if a in ("status", "state"):
+        unit = ent.get("attributes", {}).get("unit_of_measurement", "")
+        return f"{label} is {ent.get('state')}{(' ' + unit) if unit else ''}."
+    svc = _HA_SERVICES.get(domain, {}).get(a) or _HA_GENERIC.get(a) or a
+    if svc == "unlock" and os.environ.get("HA_ALLOW_UNLOCK", "") != "1":
+        return (f"For safety I don't unlock {label} by voice. "
+                "Set HA_ALLOW_UNLOCK=1 in .env if you really want that.")
+    try:
+        import httpx
+        r = httpx.post(f"{url}/api/services/{domain}/{svc}", headers={"Authorization": f"Bearer {tok}"},
+                       json={"entity_id": eid}, timeout=8)
+        if r.status_code >= 400:
+            try:
+                why = r.json().get("message", "")
+            except Exception:
+                why = r.text[:100]
+            return f"Home Assistant couldn't {a.replace('_', ' ')} {label} ({why or r.status_code})."
+        _HA_CACHE["at"] = 0.0   # state changed; refresh next time
+        return f"{label} {_HA_DONE.get(svc, svc.replace('_', ' '))}."
     except Exception as e:
         return f"Home Assistant error ({e})."
+
+
+def ha_list() -> str:
+    """List the smart devices (and sensor readings) Home Assistant has discovered."""
+    if not all(_ha()):
+        return ("Home Assistant isn't linked yet. Once you install it and set HA_URL and "
+                "HA_TOKEN in .env, it auto-discovers your devices and I control them all.")
+    states = _ha_states(max_age=0)
+    if states is None:
+        return "Couldn't reach Home Assistant. Check HA_URL and that it's running."
+    names = [f"{s['attributes']['friendly_name']} ({s['state']})" for s in states
+             if s["entity_id"].split(".")[0] in _HA_CONTROLLABLE + ("sensor",) and s["attributes"].get("friendly_name")]
+    return "Home Assistant devices: " + (", ".join(names[:40]) if names else "none found.")
 
 
 def ha_control(entity: str, action: str = "toggle") -> str:
-    """Turn a Home Assistant device on/off/toggle by its friendly name."""
-    url, tok = _ha()
-    if not url or not tok:
+    """Control a Home Assistant device by its friendly name: on, off, toggle, open, close, lock,
+    unlock, play, pause, status..."""
+    if not all(_ha()):
         return ("Home Assistant isn't linked yet. Install it, then set HA_URL and HA_TOKEN in .env "
                 "— it discovers your bulbs, plugs, TVs, etc. and I control them by name.")
-    try:
-        import httpx
-        headers = {"Authorization": f"Bearer {tok}"}
-        states = httpx.get(url + "/api/states", headers=headers, timeout=8).json()
-        el = (entity or "").lower().strip()
-        ent = None
-        for s in states:
-            fn = s.get("attributes", {}).get("friendly_name", "").lower()
-            if el == fn or el == s["entity_id"] or (el and el in fn):
-                ent = s["entity_id"]; break
-        if not ent:
-            return f"No Home Assistant device named '{entity}'."
-        domain = ent.split(".")[0]
-        svc = {"on": "turn_on", "off": "turn_off", "toggle": "toggle"}.get((action or "toggle").lower(), action)
-        httpx.post(f"{url}/api/services/{domain}/{svc}", headers=headers,
-                   json={"entity_id": ent}, timeout=8)
-        return f"{entity} {svc.replace('_', ' ')}."
-    except Exception as e:
-        return f"Home Assistant error ({e})."
+    ent = _ha_find(entity)
+    if not ent:
+        if _ha_states() is None:
+            return "Couldn't reach Home Assistant. Check HA_URL and that it's running."
+        return f"No Home Assistant device named '{entity}'."
+    return _ha_call(ent, action)
+
+
+def inventory() -> str:
+    """The user's configured devices, one group per tool, for the system prompt — so the model
+    uses real names and picks the right integration instead of guessing."""
+    cfg = _cfg()
+    kinds = {"wol": "wake-on-LAN PC", "http": "relay", "light": "light", "plug": "plug",
+             "mqtt": "ESP node", "ping": "online check only"}
+    parts = []
+    if cfg.get("lights"):
+        parts.append("lights → control_light: " + ", ".join(cfg["lights"]))
+    if cfg.get("plugs"):
+        parts.append("plugs → control_plug: " + ", ".join(cfg["plugs"]))
+    if cfg.get("devices"):
+        parts.append("network devices → control_device: " + ", ".join(
+            f"{k} ({kinds.get(v.get('type'), v.get('type'))})" for k, v in cfg["devices"].items()))
+    if cfg.get("computers"):
+        parts.append("other computers → remote_pc: " + ", ".join(cfg["computers"]))
+    states = _ha_states(timeout=2) or []
+    ha = [f"{s['attributes']['friendly_name']} ({s['entity_id'].split('.')[0]})" for s in states
+          if s["entity_id"].split(".")[0] in _HA_CONTROLLABLE + ("sensor",) and s["attributes"].get("friendly_name")]
+    if ha:
+        parts.append("Home Assistant → ha_control: " + ", ".join(ha[:40]))
+    if not parts:
+        return ""
+    return "The user's devices — use these exact names with the tool shown: " + "; ".join(parts) + "."
 
 
 # ── Registry: schemas the LLM sees, and the dispatcher ───────────────────────
@@ -752,14 +936,14 @@ TOOLS_SPEC = [
             "action": {"type": "string"}, "media": {"type": "string", "description": "media URL to cast, if action is cast"}}, "required": ["action"]}}},
     {"type": "function", "function": {
         "name": "ha_list",
-        "description": "List the smart-home devices Home Assistant has discovered on the network.",
+        "description": "List the smart-home devices Home Assistant has discovered, with their current state and sensor readings.",
         "parameters": {"type": "object", "properties": {}}}},
     {"type": "function", "function": {
         "name": "ha_control",
-        "description": "Turn a smart-home device on/off/toggle via Home Assistant, by its name (bulbs, plugs, fans, TVs, locks, etc.).",
+        "description": "Control a Home Assistant device by its name (lights, switches, fans, AC, covers/garage doors, locks, TVs, scenes) or read a sensor.",
         "parameters": {"type": "object", "properties": {
-            "entity": {"type": "string", "description": "device name, e.g. living room light"},
-            "action": {"type": "string", "description": "on, off, or toggle"}}, "required": ["entity"]}}},
+            "entity": {"type": "string", "description": "device name, e.g. Kitchen Light, Garage Door"},
+            "action": {"type": "string", "description": "on, off, toggle, open, close, lock, unlock, play, pause, or status (read its state/sensor value)"}}, "required": ["entity"]}}},
 ]
 
 _DISPATCH = {

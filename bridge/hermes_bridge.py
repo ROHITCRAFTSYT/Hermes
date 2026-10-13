@@ -112,6 +112,7 @@ _CRYPTO_PRICE = re.compile(
     r"\b(bitcoin|btc|ethereum|eth|solana|dogecoin|doge|xrp|crypto|cryptocurrency|memecoin|coin|token)s?\b", re.I)
 
 
+_PERSONAL = re.compile(r"\b(my|mine)\b", re.I)
 _MUSIC_QUESTION = re.compile(r"\b(spotify|what'?s playing|what is playing|this song|current song|which song)\b", re.I)
 _PLAY_MUSIC = re.compile(r"^\s*(please\s+|can you\s+|hey\s+\w+,?\s+)?play\b(?!.*\b(youtube|video)s?\b)", re.I)
 
@@ -124,6 +125,8 @@ def _first_tool(text: str) -> str | None:
         return None   # open/close/pause Spotify etc.: the model picks the right tool
     if _MUSIC_QUESTION.search(text):
         return "spotify"
+    if _PERSONAL.search(text):
+        return None   # "where are my keys?" is about the user (memory, devices), not the web
     if _CRYPTO_PRICE.search(text):
         return "crypto_price"
     return "web_search" if _FACT_QUESTION.search(text) else None
@@ -132,7 +135,7 @@ def _first_tool(text: str) -> str | None:
 def _system_prompt(user_text: str) -> str:
     now = datetime.now()
     return (f"{SYSTEM_PROMPT} Today is {now:%A, %d %B %Y} and the local time is {now:%I:%M %p}. "
-            f"{FRESHNESS_RULE} {_language_hint(user_text)}")
+            f"{FRESHNESS_RULE} {T.inventory()} {T.memory_facts()} {_language_hint(user_text)}")
 
 try:
     from groq import Groq
@@ -299,7 +302,8 @@ def _nvidia_chat(messages: list[dict], force: str | None = None) -> dict:
         "stream": False,
         **_reasoning_args(NVIDIA_LLM_MODEL),
     }
-    r = httpx.post(
+    # retries=2 re-sends on connection resets (WinError 10054), not on HTTP errors.
+    r = httpx.Client(transport=httpx.HTTPTransport(retries=2)).post(
         NVIDIA_BASE_URL + "/chat/completions",
         headers={
             "Authorization": f"Bearer {NVIDIA_API_KEY}",
@@ -388,9 +392,19 @@ def _run_agent_locked(user_text: str) -> str:
             try:
                 msg = _chat_completion(messages, force)
             except Exception as e:
-                if not force or _is_rate_limit(e):
+                if not force or force == "none" or _is_rate_limit(e):
                     raise
                 msg = _chat_completion(messages)   # provider refused a forced tool call; let the model choose
+            if force == "none" and msg["tool_calls"]:
+                # Some models (NVIDIA nemotron) emit tool calls even when none are offered — never run them.
+                msg["tool_calls"] = []
+                if not (msg["content"] or "").strip():
+                    messages.append({"role": "system", "content": "Answer the user now in one or two "
+                                     "sentences from the information above. Do not call any tools."})
+                    msg = _chat_completion(messages, "none")
+                    msg["tool_calls"] = []
+                if not (msg["content"] or "").strip():
+                    msg["content"] = "Sorry, I couldn't finish looking that up in time. Please ask again."
         except Exception as e:
             print("   [LLM] failed:", _compact_error(e))
             reply = _model_error_reply(e)

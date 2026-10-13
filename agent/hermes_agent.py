@@ -26,7 +26,20 @@ import webbrowser
 from urllib.parse import quote
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-TOKEN = os.environ.get("HERMES_TOKEN", "CHANGE_ME_TO_YOUR_HERMES_TOKEN")
+_PLACEHOLDER = "CHANGE_ME_TO_YOUR_HERMES_TOKEN"
+_TOKEN_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "hermes_agent_token.txt")
+
+
+def _load_token():
+    # HERMES_TOKEN env var, else the file install_agent.bat writes next to this script.
+    tok = os.environ.get("HERMES_TOKEN", "").strip()
+    if not tok and os.path.exists(_TOKEN_FILE):
+        with open(_TOKEN_FILE, encoding="utf-8") as f:
+            tok = f.read().strip()
+    return "" if tok == _PLACEHOLDER else tok
+
+
+TOKEN = _load_token()   # empty = refuse every command (a public default token would let anyone in)
 PORT = int(os.environ.get("HERMES_AGENT_PORT", "8799"))
 
 APP_ALIASES = {
@@ -99,17 +112,56 @@ def media(action):
     return f"Done: {action.replace('_', ' ')}."
 
 
+# Spoken name -> executable, for apps whose window title doesn't contain their name (Spotify, VS Code…).
+_APP_EXE = {"google chrome": "chrome", "edge": "msedge", "microsoft edge": "msedge", "vscode": "code",
+            "vs code": "code", "visual studio code": "code", "files": "explorer", "file explorer": "explorer",
+            "word": "winword", "powerpoint": "powerpnt"}
+_BROWSERS = ("chrome", "msedge", "firefox", "brave", "opera", "vivaldi", "comet", "arc", "zen", "chromium")
+
+
+def _exe_of(hwnd):
+    """Lower-case executable name of the process that owns a window (stdlib ctypes only)."""
+    try:
+        pid = ctypes.c_ulong()
+        ctypes.windll.user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        h = ctypes.windll.kernel32.OpenProcess(0x1000, False, pid.value)   # PROCESS_QUERY_LIMITED_INFORMATION
+        if not h:
+            return ""
+        try:
+            buf, size = ctypes.create_unicode_buffer(520), ctypes.c_ulong(520)
+            if not ctypes.windll.kernel32.QueryFullProcessImageNameW(h, 0, buf, ctypes.byref(size)):
+                return ""
+            return os.path.splitext(os.path.basename(buf.value))[0].lower()
+        finally:
+            ctypes.windll.kernel32.CloseHandle(h)
+    except Exception:
+        return ""
+
+
+def _app_windows(name):
+    """Windows of the named app: by program first, then by title — never a browser by tab title,
+    because closing a browser window closes every tab in it."""
+    import win32gui
+    n = re.sub(r"\b(the|my|app|application|window|windows|program)\b", " ", (name or "").lower())
+    n = " ".join(n.split())
+    exe = _APP_EXE.get(n, n.replace(" ", ""))
+    wins = []
+    def cb(h, _):
+        if win32gui.IsWindowVisible(h):
+            t = win32gui.GetWindowText(h)
+            if t.strip() and "hermes" not in t.lower():
+                wins.append((h, t, _exe_of(h)))
+    win32gui.EnumWindows(cb, None)
+    if n in ("browser", "web browser"):
+        return [(h, t) for h, t, e in wins if e in _BROWSERS]
+    by_program = [(h, t) for h, t, e in wins if e and e == exe]
+    return by_program or [(h, t) for h, t, e in wins if n and n in t.lower() and e not in _BROWSERS]
+
+
 def close_app(name):
     try:
         import win32gui, win32con
-        n = (name or "").lower().strip()
-        hits = []
-        def cb(h, _):
-            if win32gui.IsWindowVisible(h):
-                t = win32gui.GetWindowText(h)
-                if t and n in t.lower() and "hermes" not in t.lower():
-                    hits.append((h, t))
-        win32gui.EnumWindows(cb, None)
+        hits = _app_windows(name)
         for h, _t in hits:
             win32gui.PostMessage(h, win32con.WM_CLOSE, 0, 0)
         return f"Closed {hits[0][1]}." if hits else f"No window matches '{name}'."
@@ -120,14 +172,7 @@ def close_app(name):
 def switch_window(name):
     try:
         import win32gui, win32con
-        n = (name or "").lower().strip()
-        hits = []
-        def cb(h, _):
-            if win32gui.IsWindowVisible(h):
-                t = win32gui.GetWindowText(h)
-                if t and n in t.lower():
-                    hits.append((h, t))
-        win32gui.EnumWindows(cb, None)
+        hits = _app_windows(name)
         if not hits:
             return f"No window matches '{name}'."
         h, t = sorted(hits, key=lambda x: len(x[1]))[0]
@@ -185,7 +230,9 @@ class Handler(BaseHTTPRequestHandler):
             self._send(404, {"error": "not found"})
 
     def do_POST(self):
-        if TOKEN and self.headers.get("X-Hermes-Token") != TOKEN:
+        if not TOKEN:
+            self._send(401, {"error": "no token set on this PC — re-run install_agent.bat"}); return
+        if self.headers.get("X-Hermes-Token") != TOKEN:
             self._send(401, {"error": "bad token"}); return
         if not self.path.startswith("/do"):
             self._send(404, {"error": "not found"}); return
@@ -219,8 +266,8 @@ if __name__ == "__main__":
     print("=" * 58)
     print(f"  Hermes agent on {socket.gethostname()}")
     print(f"  Listening: http://{ip}:{PORT}")
-    print(f"  Add to the brain's devices.json under \"computers\":")
+    print("  Add to the brain's devices.json under \"computers\":")
     print(f'    "this laptop": {{ "url": "http://{ip}:{PORT}", "token": "<your token>" }}')
-    print(f"  Token auth: {'ON' if TOKEN else 'OFF'}")
+    print(f"  Token: {'set' if TOKEN else 'MISSING — every command will be refused. Set HERMES_TOKEN or re-run install_agent.bat'}")
     print("=" * 58)
     ThreadingHTTPServer(("0.0.0.0", PORT), Handler).serve_forever()

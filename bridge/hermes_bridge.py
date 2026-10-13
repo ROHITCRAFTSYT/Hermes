@@ -112,6 +112,7 @@ _CRYPTO_PRICE = re.compile(
     r"\b(bitcoin|btc|ethereum|eth|solana|dogecoin|doge|xrp|crypto|cryptocurrency|memecoin|coin|token)s?\b", re.I)
 
 
+_MUSIC_QUESTION = re.compile(r"\b(spotify|what'?s playing|what is playing|this song|current song|which song)\b", re.I)
 _PLAY_MUSIC = re.compile(r"^\s*(please\s+|can you\s+|hey\s+\w+,?\s+)?play\b(?!.*\b(youtube|video)s?\b)", re.I)
 
 
@@ -120,7 +121,9 @@ def _first_tool(text: str) -> str | None:
     if _PLAY_MUSIC.search(text):
         return "spotify"
     if _COMMAND.match(text) or _NO_SEARCH.search(text):
-        return None
+        return None   # open/close/pause Spotify etc.: the model picks the right tool
+    if _MUSIC_QUESTION.search(text):
+        return "spotify"
     if _CRYPTO_PRICE.search(text):
         return "crypto_price"
     return "web_search" if _FACT_QUESTION.search(text) else None
@@ -164,7 +167,17 @@ def transcribe(audio: bytes, filename: str = "speech.wav") -> str:
             file=(filename, audio, "application/octet-stream"),
             model=STT_MODEL,
         )
-        return (result.text or "").strip()
+        text = (result.text or "").strip()
+        # Whisper guesses the language per clip and sometimes hears short English as Hindi etc.
+        # Hermes speaks English and Tamil, so anything with neither script is re-run as English.
+        if text and not re.search(r"[A-Za-z஀-௿]", text):
+            print(f"   [STT] heard {text!r} (not English/Tamil) — retrying as English")
+            result = _client.audio.transcriptions.create(
+                file=(filename, audio, "application/octet-stream"),
+                model=STT_MODEL, language="en",
+            )
+            text = (result.text or "").strip() or text
+        return text
     except Exception as e:
         print("   [STT] failed:", _compact_error(e))
         return ""

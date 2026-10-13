@@ -344,7 +344,8 @@ def remember(operation: str, key: str = "", value: str = "") -> str:
 
 # ── Windows: close, switch, screenshot ───────────────────────────────────────
 
-_PROTECTED = ("hermes", "program manager")
+# Never close/switch away these: the bridge's own console (titled after its launch command) and the desktop.
+_PROTECTED = ("hermes_bridge", "start_bridge", "hermes bridge", "program manager")
 
 
 def _windows():
@@ -359,11 +360,54 @@ def _windows():
     return out
 
 
+# Spoken app name -> executable name, for apps whose window title doesn't say their name
+# (Spotify shows the song, VS Code shows the file, Explorer shows the folder).
+_APP_EXE = {"google chrome": "chrome", "edge": "msedge", "microsoft edge": "msedge",
+            "vscode": "code", "vs code": "code", "visual studio code": "code",
+            "files": "explorer", "file explorer": "explorer", "explorer": "explorer",
+            "word": "winword", "powerpoint": "powerpnt", "teams": "ms-teams"}
+_BROWSERS = ("chrome", "msedge", "firefox", "brave", "opera", "vivaldi", "comet", "arc", "zen",
+             "chromium", "thorium", "librewolf", "waterfox", "yandex", "iexplore")
+
+
+def _exe_of(hwnd) -> str:
+    """Lower-case executable name (e.g. 'spotify') of the process that owns a window."""
+    import win32process
+    try:
+        _, pid = win32process.GetWindowThreadProcessId(hwnd)
+        k32 = ctypes.windll.kernel32
+        h = k32.OpenProcess(0x1000, False, pid)   # PROCESS_QUERY_LIMITED_INFORMATION
+        if not h:
+            return ""
+        try:
+            buf, size = ctypes.create_unicode_buffer(520), ctypes.c_ulong(520)
+            ok = k32.QueryFullProcessImageNameW(h, 0, buf, ctypes.byref(size))
+            return Path(buf.value).stem.lower() if ok else ""
+        finally:
+            k32.CloseHandle(h)
+    except Exception:
+        return ""
+
+
+def _app_windows(name: str) -> list[tuple[int, str]]:
+    """Windows belonging to the app the user named: by program first, then by title.
+    Title matches skip browsers — closing one closes every tab, not just the matching one."""
+    n = re.sub(r"\b(the|my|app|application|window|windows|program)\b", " ", (name or "").lower()).strip()
+    n = " ".join(n.split())
+    exe = _APP_EXE.get(n, n.replace(" ", ""))
+    wins = [(h, t, _exe_of(h)) for h, t in _windows() if not any(p in t.lower() for p in _PROTECTED)]
+    if n in ("browser", "web browser"):   # whichever browser is open
+        return [(h, t) for h, t, e in wins if e in _BROWSERS]
+    by_program = [(h, t) for h, t, e in wins if e and e == exe]
+    if by_program:
+        return by_program
+    return [(h, t) for h, t, e in wins if n and n in t.lower() and e not in _BROWSERS]
+
+
 def switch_window(name: str) -> str:
-    """Bring the window whose title contains `name` to the front."""
+    """Bring the named app's window (or a window whose title contains `name`) to the front."""
     import win32gui, win32con
-    n = (name or "").lower().strip()
-    matches = [(h, t) for h, t in _windows() if n in t.lower()]
+    matches = _app_windows(name)
     if not matches:
         return f"No open window matches '{name}'."
     hwnd, title = sorted(matches, key=lambda x: len(x[1]))[0]
@@ -376,24 +420,15 @@ def switch_window(name: str) -> str:
 
 
 def close_app(name: str) -> str:
-    """Gracefully close the window(s) matching `name` (asks to save if needed)."""
+    """Gracefully close the named app's window(s) (the app may ask to save first)."""
     import win32gui, win32con
-    aliases = {"browser": "chrome", "vscode": "visual studio code",
-               "vs code": "visual studio code", "files": "file explorer",
-               "explorer": "file explorer"}
-    n = (name or "").lower().strip()
-    needle = aliases.get(n, n)
     closed = []
-    for hwnd, title in _windows():
-        tl = title.lower()
-        if any(p in tl for p in _PROTECTED):
-            continue
-        if needle in tl:
-            try:
-                win32gui.PostMessage(hwnd, win32con.WM_CLOSE, 0, 0)
-                closed.append(title)
-            except Exception:
-                pass
+    for hwnd, title in _app_windows(name):
+        try:
+            win32gui.PostMessage(hwnd, win32con.WM_CLOSE, 0, 0)
+            closed.append(title)
+        except Exception:
+            pass
     if not closed:
         return f"No open window matches '{name}'."
     return f"Closed {closed[0]}." if len(closed) == 1 else f"Closed {len(closed)} '{name}' windows."

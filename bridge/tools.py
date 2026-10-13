@@ -297,6 +297,11 @@ def crypto_price(coin: str) -> str:
         return web_search(f"{coin} crypto price today")
 
 
+def spotify(action: str, query: str = "", level: int | None = None) -> str:
+    import spotify as sp
+    return sp.control(action, query, level)
+
+
 def read_page(url: str, max_chars: int = 2500) -> str:
     try:
         import httpx
@@ -652,6 +657,13 @@ TOOLS_SPEC = [
         "parameters": {"type": "object", "properties": {
             "coin": {"type": "string", "description": "coin name or ticker, e.g. 'solana', 'BTC', 'trump'"}}, "required": ["coin"]}}},
     {"type": "function", "function": {
+        "name": "spotify",
+        "description": "Play music on Spotify and control it. Use this whenever the user asks to play a song, artist, album or playlist (on Spotify or just 'play <song>'). actions: play (with 'query' = song/artist name; prefix with 'album ', 'artist ' or 'playlist ' for those), resume, pause, next, previous, volume (with 'level' 0-100), now_playing.",
+        "parameters": {"type": "object", "properties": {
+            "action": {"type": "string", "description": "play, resume, pause, next, previous, volume, now_playing"},
+            "query": {"type": "string", "description": "what to play, e.g. 'Over My Dead Body Drake' or 'artist Anirudh'"},
+            "level": {"type": "integer", "description": "volume 0-100, for action volume"}}, "required": ["action"]}}},
+    {"type": "function", "function": {
         "name": "read_page",
         "description": "Fetch a URL and return its readable text so you can answer from it.",
         "parameters": {"type": "object", "properties": {
@@ -724,6 +736,7 @@ _DISPATCH = {
     "youtube": youtube,
     "web_search": web_search,
     "crypto_price": crypto_price,
+    "spotify": spotify,
     "read_page": read_page,
     "remember": remember,
     "close_app": close_app,

@@ -5,6 +5,7 @@ firmware/hermes_satellite/config.h
 bridge/devices.json
 bridge/conversation.json
 bridge/memory.json
+bridge/spotify_token.json
 
 # ── Python ──────────────────────────────────────────────────────────────────
 **/.venv/

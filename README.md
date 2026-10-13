@@ -36,6 +36,9 @@ cheap and the AI stays as powerful as you like.
   websites and YouTube in your browser ("surf" mode).
 - 🖥️ **PC & media control** — open/close apps, switch windows, play/pause,
   volume, screenshots, lock the PC.
+- 🎵 **Spotify** — "play Over My Dead Body" plays that exact song (Premium, one‑time login).
+- 📈 **Always current** — knows today's date, searches the web before answering
+  anything that changes, and pulls live crypto prices from CoinGecko.
 - 🏠 **Smart‑home control** — Tuya bulbs/plugs, custom ESP relay nodes (MQTT),
   Wake‑on‑LAN, HTTP devices, and **Home Assistant** (1000s of devices).
 - 📺 **TV / Cast control** — Chromecast / Google Cast / Android TV, no app on the TV.
@@ -105,6 +108,7 @@ HermesAgent/
 ├─ bridge/                        ← the PC "brain" (Python / FastAPI)
 │  ├─ hermes_bridge.py            ← STT → agent loop → TTS + web/app server
 │  ├─ tools.py                    ← every tool: web, PC, smart home, network…
+│  ├─ spotify.py                  ← Spotify login (PKCE) + playback
 │  ├─ requirements.txt
 │  ├─ .env.example                ← copy to .env, add your Groq key + token
 │  ├─ devices.example.json        ← copy to devices.json, add your devices
@@ -190,6 +194,22 @@ installs a tiny agent that auto‑starts at login, and prints that PC's IP. Add 
 to `bridge/devices.json` under `computers`, then say *"open notepad on the other
 laptop"*.
 
+### 5 — Spotify playback (optional, needs Premium)
+
+Spotify only allows playing a chosen song through its Web API, which needs a
+**Premium** account and a free developer app (one time, ~5 minutes):
+
+1. Go to https://developer.spotify.com/dashboard → **Create app**. Any name and
+   description; **Redirect URI** `http://127.0.0.1:8787/spotify/callback` (use
+   your `PORT` if you changed it); tick **Web API**; save.
+2. Copy the app's **Client ID** into `bridge/.env` as `SPOTIFY_CLIENT_ID=…` and
+   restart the brain.
+3. On the PC, open **http://127.0.0.1:8787/spotify/login** and click **Agree**.
+
+Login uses PKCE, so there's no client secret; the token is saved in
+`bridge/spotify_token.json` (git‑ignored) and refreshes itself. If Spotify isn't
+running, Hermes starts the desktop app and plays on it.
+
 ---
 
 ## 🗣️ Usage — say things like…
@@ -201,6 +221,8 @@ laptop"*.
 | Web / surf | "open YouTube" · "go to Gmail" · "browse for weather in Chennai" |
 | YouTube | "search YouTube for lofi music" |
 | PC & media | "pause" · "volume up" · "take a screenshot" · "lock the PC" |
+| Spotify | "play Over My Dead Body" · "play artist Anirudh" · "play playlist Today's Top Hits" · "next song" · "what's playing?" |
+| Live prices | "what's the price of Bitcoin?" · "how much is Solana?" |
 | Windows | "close Chrome" · "switch to Word" |
 | Network | "scan the network" · "wake my desktop" · "is the printer online?" |
 | Smart home | "turn on the bedroom light" · "turn off the fan plug" |
@@ -215,7 +237,8 @@ laptop"*.
 
 ## ⚙️ Configuration reference
 
-- **`bridge/.env`** — Groq/NVIDIA keys, models, `HERMES_TOKEN`, `PLAY_ON_PC`.
+- **`bridge/.env`** — Groq/NVIDIA keys, models, `HERMES_TOKEN`, `PLAY_ON_PC`,
+  `SPOTIFY_CLIENT_ID`, `LLM_MAX_TOKENS` / `REASONING_EFFORT`.
 - **`firmware/…/config.h`** — `BRIDGE_HOST`/`BRIDGE_TOKEN`, `MAX_RECORD_SECONDS`,
   `MIC_GAIN_SHIFT` (lower = louder), `USE_MDNS`.
 - **`bridge/devices.json`** — named devices for control‑by‑voice:
@@ -239,6 +262,10 @@ laptop"*.
 | ESP can't reach bridge | Same Wi‑Fi? Allow the firewall prompt. mDNS blocked on some hotspots → set `BRIDGE_HOST` to the printed IP. |
 | Replies come out in the wrong language | Say **"new conversation"** — a prior language instruction can linger in memory. |
 | Mic too quiet | Lower `MIC_GAIN_SHIFT` in `config.h` (e.g. 11–13). |
+| Words dropped / garbled | Mic is clipping — check the `[Rec] … peak` serial line; raise `MIC_GAIN_SHIFT` (default 16). |
+| *"Spotify isn't connected"* | Open `http://127.0.0.1:8787/spotify/login` **on the PC** (it refuses other devices). |
+| *"needs a Spotify Premium account"* | Spotify blocks playback control on free accounts — Hermes can still open Spotify and use play/pause media keys. |
+| Spotify login says *invalid redirect URI* | The app's Redirect URI must be exactly `http://127.0.0.1:8787/spotify/callback`. |
 
 ---
 

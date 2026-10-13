@@ -16,6 +16,7 @@ Run:  .venv\\Scripts\\python hermes_bridge.py
 import os
 import json
 import base64
+import html
 import socket
 import asyncio
 import tempfile
@@ -29,11 +30,12 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, Request, Response, HTTPException
-from fastapi.responses import JSONResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 import uvicorn
 
 import tools as T
+import spotify as SP
 
 for _stream in (sys.stdout, sys.stderr):
     try:
@@ -110,8 +112,13 @@ _CRYPTO_PRICE = re.compile(
     r"\b(bitcoin|btc|ethereum|eth|solana|dogecoin|doge|xrp|crypto|cryptocurrency|memecoin|coin|token)s?\b", re.I)
 
 
+_PLAY_MUSIC = re.compile(r"^\s*(please\s+|can you\s+|hey\s+\w+,?\s+)?play\b(?!.*\b(youtube|video)s?\b)", re.I)
+
+
 def _first_tool(text: str) -> str | None:
-    """Tool the model must call first, so it can't answer from stale memory."""
+    """Tool the model must call first: fresh data for questions, Spotify for 'play <song>'."""
+    if _PLAY_MUSIC.search(text):
+        return "spotify"
     if _COMMAND.match(text) or _NO_SEARCH.search(text):
         return None
     if _CRYPTO_PRICE.search(text):
@@ -552,6 +559,33 @@ async def talk(request: Request):
     return JSONResponse({"heard": heard, "reply": reply, "audio_b64": audio_b64})
 
 
+def _local_only(request: Request):
+    # Spotify login only from this PC: its redirect URI is 127.0.0.1, and LAN devices shouldn't link accounts.
+    if (request.client.host if request.client else "") not in ("127.0.0.1", "::1"):
+        raise HTTPException(status_code=403, detail="Open this page on the PC running Hermes.")
+
+
+@app.get("/spotify/login")
+async def spotify_login(request: Request):
+    _local_only(request)
+    if not SP.client_id():
+        return HTMLResponse("<h2>Add SPOTIFY_CLIENT_ID to bridge/.env and restart Hermes first.</h2>", 400)
+    return RedirectResponse(SP.login_url())
+
+
+@app.get("/spotify/callback")
+async def spotify_callback(request: Request, code: str = "", state: str = "", error: str = ""):
+    _local_only(request)
+    if error or not code:
+        return HTMLResponse(f"<h2>Spotify login cancelled ({error or 'no code'}).</h2>", 400)
+    try:
+        await asyncio.to_thread(SP.finish_login, code, state)
+    except Exception as e:
+        return HTMLResponse(f"<h2>Spotify login failed</h2><p>{html.escape(str(e))}</p>", 400)
+    print("   [Spotify] connected ✅")
+    return HTMLResponse("<h2>Spotify connected ✅</h2><p>You can close this tab and ask Hermes to play a song.</p>")
+
+
 @app.get("/health")
 async def health():
     return {"ok": True, "name": NAME, "brain": bool(_client or NVIDIA_API_KEY),
@@ -602,6 +636,8 @@ if __name__ == "__main__":
     print(f"  {NAME} bridge")
     print(f"  Brain (Groq)  : {'connected ✅' if _client else 'MISSING ❌  add key to .env'}")
     print(f"  Auth token    : {'ON 🔒' if TOKEN else 'off (LAN only — set HERMES_TOKEN before exposing!)'}")
+    if SP.client_id():
+        print(f"  Spotify       : {'connected ✅' if SP.is_connected() else f'not linked — open http://127.0.0.1:{PORT}/spotify/login on this PC'}")
     print(f"  On this LAN   : http://{ip}:{PORT}/app/   (open on your phone)")
     print(f"  ESP config.h  : BRIDGE_HOST \"{ip}\"  (or leave USE_MDNS 1)")
     print("=" * 62)

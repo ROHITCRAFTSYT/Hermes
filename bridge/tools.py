@@ -252,6 +252,51 @@ def web_search(query: str, max_results: int = 5) -> str:
         return f"Web search failed ({e})."
 
 
+_COIN_CACHE: dict[str, dict] = {}   # spoken name -> CoinGecko coin, saves a call on repeat questions
+
+
+def crypto_price(coin: str) -> str:
+    """Live cryptocurrency price from CoinGecko's free public API (no key needed).
+    Falls back to web_search if CoinGecko is rate-limiting or unreachable."""
+    def money(v):
+        return f"{v:,.2f}" if v >= 1 else f"{v:.6g}"
+    try:
+        import httpx
+        api = "https://api.coingecko.com/api/v3"
+        http = httpx.Client(timeout=6, transport=httpx.HTTPTransport(retries=2))   # retries connection resets
+
+        def get(path, **params):
+            r = http.get(api + path, params=params)
+            r.raise_for_status()   # 429 when the free tier is busy
+            return r.json()
+
+        key = coin.lower().strip()
+        c = _COIN_CACHE.get(key)
+        if not c:
+            # "trump coin" finds nothing, "trump" finds OFFICIAL TRUMP — drop filler words first.
+            name = re.sub(r"\b(coin|coins|token|crypto|cryptocurrency|price|the|of|current)\b", " ",
+                          coin, flags=re.I).strip() or coin
+            hits = []
+            for q in dict.fromkeys([name, coin]):
+                hits = get("/search", query=q).get("coins", [])
+                if hits:
+                    break
+            if not hits:
+                return f"No cryptocurrency found matching '{coin}'."
+            c = _COIN_CACHE[key] = hits[0]   # CoinGecko ranks search hits by market cap
+        p = get("/simple/price", ids=c["id"], vs_currencies="usd,inr",
+                include_24hr_change="true").get(c["id"], {})
+        if "usd" not in p:
+            raise ValueError("no price in response")
+        change = p.get("usd_24h_change")
+        return (f"{c['name']} ({c['symbol'].upper()}): ${money(p['usd'])} USD"
+                + (f" / ₹{money(p['inr'])} INR" if "inr" in p else "")
+                + (f", {change:+.1f}% in the last 24 hours" if change is not None else "")
+                + ". Live from CoinGecko.")
+    except Exception:
+        return web_search(f"{coin} crypto price today")
+
+
 def read_page(url: str, max_chars: int = 2500) -> str:
     try:
         import httpx
@@ -602,6 +647,11 @@ TOOLS_SPEC = [
         "parameters": {"type": "object", "properties": {
             "query": {"type": "string"}}, "required": ["query"]}}},
     {"type": "function", "function": {
+        "name": "crypto_price",
+        "description": "Get the LIVE price of a cryptocurrency or crypto token (Bitcoin, Ethereum, Solana, Dogecoin, Trump coin / OFFICIAL TRUMP, etc.) in USD and INR, with the 24-hour change. Always use this instead of web_search for crypto prices.",
+        "parameters": {"type": "object", "properties": {
+            "coin": {"type": "string", "description": "coin name or ticker, e.g. 'solana', 'BTC', 'trump'"}}, "required": ["coin"]}}},
+    {"type": "function", "function": {
         "name": "read_page",
         "description": "Fetch a URL and return its readable text so you can answer from it.",
         "parameters": {"type": "object", "properties": {
@@ -673,6 +723,7 @@ _DISPATCH = {
     "open_website": open_website,
     "youtube": youtube,
     "web_search": web_search,
+    "crypto_price": crypto_price,
     "read_page": read_page,
     "remember": remember,
     "close_app": close_app,

@@ -103,9 +103,20 @@ _COMMAND = re.compile(
     r"volume|take|show|go to|cast|remember)\b", re.I)
 
 
-def _needs_search(text: str) -> bool:
-    return bool(_FACT_QUESTION.search(text)) and not _NO_SEARCH.search(text) \
-        and not _COMMAND.match(text)
+_CRYPTO_PRICE = re.compile(
+    r"\b(bitcoin|btc|ethereum|eth|solana|dogecoin|doge|xrp|crypto|cryptocurrency|memecoin|coin|token)s?\b"
+    r".*\b(price|worth|cost|value|rate|trading)\b"
+    r"|\b(price|worth|cost|value|rate|how much)\b.*"
+    r"\b(bitcoin|btc|ethereum|eth|solana|dogecoin|doge|xrp|crypto|cryptocurrency|memecoin|coin|token)s?\b", re.I)
+
+
+def _first_tool(text: str) -> str | None:
+    """Tool the model must call first, so it can't answer from stale memory."""
+    if _COMMAND.match(text) or _NO_SEARCH.search(text):
+        return None
+    if _CRYPTO_PRICE.search(text):
+        return "crypto_price"
+    return "web_search" if _FACT_QUESTION.search(text) else None
 
 
 def _system_prompt(user_text: str) -> str:
@@ -347,10 +358,10 @@ def _run_agent_locked(user_text: str) -> str:
     messages = [{"role": "system", "content": _system_prompt(user_text)}] + CONVO[-_CONVO_MAX:] + \
                [{"role": "user", "content": user_text}]
     reply = "Okay."
-    search_first = _needs_search(user_text)
+    first_tool = _first_tool(user_text)
     started = time.monotonic()
     for step in range(6):
-        force = "web_search" if step == 0 and search_first else None
+        force = first_tool if step == 0 else None
         if step and time.monotonic() - started > AGENT_DEADLINE_S:
             force = "none"   # out of time: no more tools, answer from what we have
         try:

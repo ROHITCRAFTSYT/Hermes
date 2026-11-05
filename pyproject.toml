@@ -1,0 +1,28 @@
+[project]
+name = "hermes-bridge"
+version = "1.1.0"
+requires-python = ">=3.11"
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+src = ["bridge"]
+extend-exclude = ["firmware"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "B", "I", "UP"]
+ignore = ["E701", "E702", "B008"]
+
+[tool.ruff.lint.per-file-ignores]
+# long tool descriptions are prompt text, wrapping them hurts more than it helps
+"bridge/tools.py" = ["E501"]
+"bridge/timers.py" = ["E501"]
+"agent/hermes_agent.py" = ["E501"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["config", "logs", "net", "providers", "ratelimit", "tools", "spotify", "timers", "hermes_bridge"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["bridge"]
+addopts = "-q"

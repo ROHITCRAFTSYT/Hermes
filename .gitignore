@@ -31,3 +31,5 @@ bridge/_direct.*
 Thumbs.db
 .DS_Store
 desktop.ini
+.pytest_cache/
+.ruff_cache/

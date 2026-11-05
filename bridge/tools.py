@@ -7,15 +7,15 @@ isn't configured yet, it says so instead of crashing, so the whole assistant
 works on first boot and you wire up hardware later.
 """
 
+import ctypes
+import json
 import os
 import re
-import json
-import ctypes
 import subprocess
 import time
 import webbrowser
-from urllib.parse import quote
 from pathlib import Path
+from urllib.parse import quote
 
 _HERE = Path(__file__).parent
 _CFG_PATH = _HERE / "devices.json"
@@ -490,7 +490,8 @@ def _app_windows(name: str) -> list[tuple[int, str]]:
 
 def switch_window(name: str) -> str:
     """Bring the named app's window (or a window whose title contains `name`) to the front."""
-    import win32gui, win32con
+    import win32con
+    import win32gui
     matches = _app_windows(name)
     if not matches:
         return f"No open window matches '{name}'."
@@ -505,7 +506,8 @@ def switch_window(name: str) -> str:
 
 def close_app(name: str) -> str:
     """Gracefully close the named app's window(s) (the app may ask to save first)."""
-    import win32gui, win32con
+    import win32con
+    import win32gui
     closed = []
     for hwnd, title in _app_windows(name):
         try:
@@ -521,8 +523,9 @@ def close_app(name: str) -> str:
 def take_screenshot() -> str:
     """Capture the screen to the Pictures/Hermes folder."""
     try:
-        from PIL import ImageGrab
         import datetime
+
+        from PIL import ImageGrab
         folder = Path(os.path.expanduser("~")) / "Pictures" / "Hermes"
         folder.mkdir(parents=True, exist_ok=True)
         fn = folder / ("screen_" + datetime.datetime.now().strftime("%Y%m%d_%H%M%S") + ".png")

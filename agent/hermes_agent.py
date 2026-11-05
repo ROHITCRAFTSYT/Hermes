@@ -16,15 +16,15 @@ The token must match the brain's HERMES_TOKEN. Edit TOKEN below or set the
 HERMES_TOKEN environment variable. Keep it on your own trusted network.
 """
 
+import ctypes
+import json
 import os
 import re
-import json
 import socket
-import ctypes
 import subprocess
 import webbrowser
-from urllib.parse import quote
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import quote
 
 _PLACEHOLDER = "CHANGE_ME_TO_YOUR_HERMES_TOKEN"
 _TOKEN_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "hermes_agent_token.txt")
@@ -160,7 +160,8 @@ def _app_windows(name):
 
 def close_app(name):
     try:
-        import win32gui, win32con
+        import win32con
+        import win32gui
         hits = _app_windows(name)
         for h, _t in hits:
             win32gui.PostMessage(h, win32con.WM_CLOSE, 0, 0)
@@ -171,7 +172,8 @@ def close_app(name):
 
 def switch_window(name):
     try:
-        import win32gui, win32con
+        import win32con
+        import win32gui
         hits = _app_windows(name)
         if not hits:
             return f"No window matches '{name}'."
@@ -184,8 +186,9 @@ def switch_window(name):
 
 def screenshot():
     try:
-        from PIL import ImageGrab
         import datetime
+
+        from PIL import ImageGrab
         folder = os.path.join(os.path.expanduser("~"), "Pictures", "Hermes")
         os.makedirs(folder, exist_ok=True)
         fn = os.path.join(folder, "screen_" + datetime.datetime.now().strftime("%Y%m%d_%H%M%S") + ".png")

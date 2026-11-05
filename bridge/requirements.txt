@@ -1,20 +1,23 @@
 # Hermes bridge — the "brain" that runs on your PC.
 # Install into a virtual env:  py -3.12 -m venv .venv  &&  .venv\Scripts\pip install -r requirements.txt
+# Versions are pinned so a fresh install behaves like the tested one. Bump deliberately.
 
-fastapi>=0.110
-uvicorn[standard]>=0.29
-groq>=0.11
-python-dotenv>=1.0
-httpx>=0.27
-beautifulsoup4>=4.12
-ddgs>=6.0
-tinytuya>=1.15
-paho-mqtt>=2.1
-zeroconf>=0.132
-pywin32>=306 ; sys_platform == "win32"
-pyttsx3>=2.90
-gTTS>=2.5
-edge-tts>=7.0      # natural neural voices (free, no key)
-miniaudio>=1.59    # MP3 -> WAV for the ESP32 / app, no ffmpeg needed
-Pillow>=10.0
-pychromecast>=14.0
+fastapi==0.162.0
+uvicorn[standard]==0.54.0
+pydantic==2.14.2
+pydantic-settings==2.16.2
+groq==1.7.0
+python-dotenv==1.2.4
+httpx==0.28.1
+beautifulsoup4==4.15.0
+ddgs==9.16.1
+tinytuya==1.20.0
+paho-mqtt==2.2.0
+zeroconf==0.153.0
+pywin32==311 ; sys_platform == "win32"
+pyttsx3==2.99
+gTTS==2.5.4
+edge-tts==7.3.1      # natural neural voices (free, no key)
+miniaudio==1.71      # MP3 -> WAV for the ESP32 / app, no ffmpeg needed
+pillow==13.0.0
+PyChromecast==14.1.1

@@ -3,7 +3,8 @@
 ![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)
 ![Platform](https://img.shields.io/badge/platform-Windows%20%2B%20ESP32-lightgrey)
 ![Python](https://img.shields.io/badge/python-3.11%2B-blue)
-![AI](https://img.shields.io/badge/AI-Groq%20%C2%B7%20Whisper%20%C2%B7%20NVIDIA-ff8a41)
+![AI](https://img.shields.io/badge/AI-Gnani%20%C2%B7%20Groq%20%C2%B7%20NVIDIA-ff8a41)
+[![CI](https://github.com/ROHITCRAFTSYT/Hermes/actions/workflows/ci.yml/badge.svg)](https://github.com/ROHITCRAFTSYT/Hermes/actions/workflows/ci.yml)
 
 Hermes turns a **₹1,500 ESP32** into a hands‑held voice assistant that runs on
 your own PC. Hold the button, talk (in **English or Tamil**), and it answers out
@@ -15,14 +16,40 @@ The clever part: the ESP32 is just the *ears and mouth*. All the intelligence
 runs in a small Python "brain" on a PC you already own, so the hardware stays
 cheap and the AI stays as powerful as you like.
 
+```mermaid
+flowchart LR
+    subgraph Satellite["ESP32 satellite / phone app"]
+        MIC["INMP441 mic<br/>push-to-talk"] --> WAV["16 kHz WAV"]
+        SPK["MAX98357A speaker"]
+    end
+
+    subgraph Brain["Hermes bridge (FastAPI, your PC or Docker)"]
+        API["/voice · /talk · /chat<br/>token auth · rate limit"]
+        STT{"STT chain"}
+        AGENT["Agent loop<br/>tool calling, memory"]
+        LLM{"LLM chain"}
+        TTS{"TTS chain"}
+        TOOLS["Tools: web search, PC control,<br/>smart home, Spotify, timers, Cast"]
+    end
+
+    WAV -- "HTTP POST" --> API --> STT
+    STT -- "1st" --> PRISMA["Gnani Prisma"]
+    STT -. "fallback" .-> WHISPER["Groq Whisper"]
+    STT --> AGENT
+    AGENT <--> LLM
+    LLM -- "1st" --> EVON["Gnani Evon<br/>(vLLM, OpenAI API)"]
+    LLM -. "fallback" .-> GROQ["Groq"] -.-> NIM["NVIDIA NIM"]
+    AGENT <--> TOOLS
+    AGENT --> TTS
+    TTS -- "1st" --> TIMBRE["Gnani Timbre"]
+    TTS -. "fallback" .-> EDGE["Edge neural"] -.-> GTTS["gTTS"] -.-> SAPI["Windows voice"]
+    TTS -- "WAV reply" --> SPK
 ```
-   ┌─────────────┐   Wi-Fi    ┌──────────────────────────────────────┐
-   │  ESP32 mic  │  ────────► │            The brain (your PC)        │
-   │  + button   │   16 kHz   │  Whisper STT → LLM + tools → TTS      │
-   │ (powerbank) │  ◄──────── │  ↳ web · PC · smart home · devices    │
-   └─────────────┘   reply    └──────────────────────────────────────┘
-        speak                         also plays reply on PC speakers
-```
+
+Each stage is a chain. `STT_PROVIDER`, `LLM_PROVIDER` and `TTS_PROVIDER` pick the first
+link. A provider with no key is skipped, and if one fails at runtime (timeout, 5xx, rate
+limit, bad key) the next one answers, so a dead API never leaves the ESP32 hanging.
+The diagram shows the Gnani-first setup used for the demo. The default is Groq first.
 
 > Built and documented as an open maker project. Total build cost **≈ ₹1,500–3,000**;
 > the brain runs on a PC you already have.
@@ -52,8 +79,10 @@ cheap and the AI stays as powerful as you like.
   human‑sounding neural voices (free, no API key).
 - 📱 **Phone/web app** — a PWA served by the brain; type or talk from any device.
 - 🔒 **Token‑secured**, LAN‑first, with optional **remote access** from anywhere.
-- 🔁 **Resilient** — auto‑discovers the brain by name (mDNS), and falls back to a
-  second LLM provider (NVIDIA) if Groq's free daily limit is hit.
+- 🇮🇳 **Gnani voice models** — Prisma speech-to-text, Timbre text-to-speech and the
+  Evon LLM as pluggable providers, chosen in `.env`.
+- 🔁 **Resilient** — auto‑discovers the brain by name (mDNS). Every provider call has a
+  timeout and bounded retries, and each stage falls back to the next provider.
 
 ---
 
@@ -109,8 +138,16 @@ HermesAgent/
 ├─ SCHEMATIC_SPEC.md              ← full wiring spec / BOM
 ├─ start_bridge.bat               ← double-click to run the brain (Windows)
 │
+├─ Dockerfile                     ← container build for the bridge
+├─ DEMO_SCRIPT.md                 ← shot list for the 60–90 s demo video
+├─ docs/launch-posts.md           ← draft LinkedIn / X posts
+├─ tests/                         ← pytest suite, all providers mocked
+│
 ├─ bridge/                        ← the PC "brain" (Python / FastAPI)
 │  ├─ hermes_bridge.py            ← STT → agent loop → TTS + web/app server
+│  ├─ config.py                   ← typed, validated settings (pydantic)
+│  ├─ providers/                  ← Gnani Prisma/Timbre/Evon, Groq, NVIDIA adapters
+│  ├─ net.py · logs.py · ratelimit.py  ← timeouts/retries, structured logs, rate limit
 │  ├─ tools.py                    ← every tool: web, PC, smart home, network…
 │  ├─ spotify.py                  ← Spotify login (PKCE) + playback
 │  ├─ timers.py                   ← timers, reminders & alarms (saved in timers.json)
@@ -145,8 +182,10 @@ python -m venv .venv
 copy .env.example .env
 ```
 
-Edit **`.env`**:
+Edit **`.env`** (every option is documented in [`bridge/.env.example`](bridge/.env.example)):
 - `GROQ_API_KEY` — a free key from https://console.groq.com/keys
+- *(optional)* `GNANI_API_KEY` plus `STT_PROVIDER=gnani` / `TTS_PROVIDER=gnani`, see
+  [Gnani demo](#-gnani-demo) below.
 - `HERMES_TOKEN` — a secret string; generate one with
   `python -c "import secrets; print(secrets.token_urlsafe(24))"`
 - *(optional)* `NVIDIA_API_KEY` — a free https://build.nvidia.com key, used as an
@@ -158,9 +197,25 @@ Run it:
 .venv\Scripts\python hermes_bridge.py      # or: double-click start_bridge.bat
 ```
 
-It prints its LAN IP and starts advertising itself over mDNS. Test in a browser:
-`http://localhost:8787/health` → should show `"brain": true`. **Allow the Windows
-Firewall prompt** so the ESP32 can reach it.
+It prints its LAN IP, the active provider chains, and starts advertising itself over
+mDNS. Test in a browser: `http://localhost:8787/health` → should show `"brain": true`
+and the providers in use. **Allow the Windows Firewall prompt** so the ESP32 can reach it.
+
+A config typo (bad URL, unknown provider, wrong language code) stops startup with a
+message naming the variable, rather than failing mid-conversation.
+
+#### Or in Docker
+
+The voice pipeline and web app run fine in a container. The PC-control tools (apps, media
+keys, the Windows voice) need Windows, so they do nothing there.
+
+```bash
+docker build -t hermes-bridge .
+docker run --rm -p 8787:8787 --env-file bridge/.env -e PLAY_ON_PC=0 hermes-bridge
+```
+
+Logs come out as one JSON object per line (`LOG_FORMAT=json`), each tagged with the
+request's `X-Request-ID`.
 
 ### 2 — The satellite (ESP32)
 
@@ -218,6 +273,59 @@ running, Hermes starts the desktop app and plays on it.
 
 ---
 
+## 🇮🇳 Gnani demo
+
+Hermes can run its whole voice loop on [Gnani.ai](https://gnani.ai) models:
+
+| Stage | Gnani model | How Hermes calls it |
+|---|---|---|
+| Speech-to-text | **Prisma** | `POST https://api.vachana.ai/stt/v3` (multipart: `audio_file`, `language_code`, `format`), header `X-API-Key-ID` |
+| Text-to-speech | **Timbre** (beta) | `POST https://api.vachana.ai/api/v1/tts/inference` (JSON: `text`, `voice`, `model`, `audio_config`), returns WAV |
+| LLM / agent | **Evon** `gnani/gnani-evon-v3.3-30B-A3B` | any OpenAI-compatible `/v1/chat/completions`, e.g. your own vLLM server |
+
+**1. Prisma + Timbre** need only an API key from the Gnani dashboard:
+
+```ini
+GNANI_API_KEY=your-key
+STT_PROVIDER=gnani
+TTS_PROVIDER=gnani
+GNANI_STT_LANGUAGE=en-IN        # ta-IN for Tamil, hi-IN for Hindi, en-IN,hi-IN for Hinglish
+GNANI_TTS_VOICE=Pranav          # timbre-v2.0: Pranav, Kaveri, Shubhra, Deepak
+```
+
+Prisma needs the language up front (Whisper guessed it per clip), so set
+`GNANI_STT_LANGUAGE` to the language you'll speak in the demo.
+
+**2. Evon** is an open-weight model on Hugging Face. Gnani doesn't document a hosted chat
+API for it that I could find, so serve it yourself and point Hermes at it. It's a 30B MoE
+with about 3B active parameters: a 4-bit quant reportedly fits a 24 GB GPU, while full bf16
+weights need around 60 GB. Tool calling needs the parser flags:
+
+```bash
+vllm serve gnani/gnani-evon-v3.3-30B-A3B --enable-auto-tool-choice \
+  --tool-call-parser qwen3_coder --reasoning-parser nano_v3
+```
+
+```ini
+LLM_PROVIDER=evon
+EVON_BASE_URL=http://<gpu-box>:8000/v1
+```
+
+If Evon is unreachable, Groq answers instead; `/health` shows which chain is live.
+
+**3. Check it:** `curl http://localhost:8787/health` should list
+`"stt": ["gnani", "groq"]`, `"llm": ["evon", ...]`, `"tts": ["gnani", "edge", ...]`.
+
+> The adapter field names come from Gnani's API docs as used by the official
+> `livekit-plugins-gnani` client (v1.8.10). They're covered by mocked tests but haven't
+> run against a live key in CI, because none is available there. The ESP32 sends WAV,
+> which Prisma documents. The browser app records webm/ogg, which may not be accepted.
+> If Prisma refuses it, that turn falls back to Whisper and logs a warning.
+
+See [`DEMO_SCRIPT.md`](DEMO_SCRIPT.md) for the video shot list.
+
+---
+
 ## 🗣️ Usage — say things like…
 
 | Category | Examples |
@@ -250,8 +358,10 @@ running, Hermes starts the desktop app and plays on it.
   `.venv\Scripts\edge-tts --list-voices`. Needs internet — if it's slow or down,
   Hermes falls back to Google's voice, then the offline Windows voice
   (`TTS_ENGINE=sapi` forces offline).
-- **`bridge/.env`** — Groq/NVIDIA keys, models, `HERMES_TOKEN`, `PLAY_ON_PC`,
-  `SPOTIFY_CLIENT_ID`, `LLM_MAX_TOKENS` / `REASONING_EFFORT`.
+- **`bridge/.env`** — provider choice (`STT_PROVIDER`, `LLM_PROVIDER`, `TTS_PROVIDER`),
+  Gnani/Groq/NVIDIA/Evon keys and models, `HERMES_TOKEN`, `RATE_LIMIT_PER_MIN`,
+  `HTTP_TIMEOUT_S` / `HTTP_RETRIES`, `LOG_FORMAT`, `PLAY_ON_PC`, `SPOTIFY_CLIENT_ID`,
+  `LLM_MAX_TOKENS` / `REASONING_EFFORT`. `TTS_ENGINE` still works as an alias for `TTS_PROVIDER`.
 - **`firmware/…/config.h`** — `BRIDGE_HOST`/`BRIDGE_TOKEN`, `MAX_RECORD_SECONDS`,
   `MIC_GAIN_SHIFT` (lower = louder), `USE_MDNS`.
 - **`bridge/devices.json`** — named devices for control‑by‑voice:
@@ -275,7 +385,10 @@ running, Hermes starts the desktop app and plays on it.
 | Spoken *"limit is full"* | Groq's **per‑model** daily token cap. Switch `LLM_MODEL` (e.g. `openai/gpt-oss-20b` → `qwen/qwen3.8-27b`) or set `NVIDIA_API_KEY` for auto‑fallback. |
 | Won't join Wi‑Fi (`reason=2/202`) | The network is **WPA3** or 5 GHz. A classic ESP32 needs **WPA2 + 2.4 GHz**. |
 | Won't join, "too many devices" (`reason=5`) | The hotspot's **device limit** is full — raise it / free a slot. |
-| `"brain": false` on `/health` | `GROQ_API_KEY` missing in `.env`. |
+| `"brain": false` on `/health` | No LLM configured: set `GROQ_API_KEY`, `NVIDIA_API_KEY` or `EVON_BASE_URL`. |
+| Bridge exits with *Invalid Hermes configuration* | The message names the bad variable in `.env`; fix that value. |
+| `429 Too many requests` | Over `RATE_LIMIT_PER_MIN` for that device. Raise it, or `0` turns the limit off. |
+| Gnani set but `/health` shows `groq` | `GNANI_API_KEY` is empty, so the chain skipped Gnani. The startup log says so. |
 | ESP can't reach bridge | Same Wi‑Fi? Allow the firewall prompt. mDNS blocked on some hotspots → set `BRIDGE_HOST` to the printed IP. |
 | Replies come out in the wrong language | Say **"new conversation"** — a prior language instruction can linger in memory. |
 | Mic too quiet | Lower `MIC_GAIN_SHIFT` in `config.h` (e.g. 11–13). |
@@ -291,9 +404,26 @@ running, Hermes starts the desktop app and plays on it.
 - **Secrets never belong in git.** `.env`, `secrets.h`, `config.h`, and
   `devices.json` are `.gitignore`d — commit only the `*.example` templates.
 - The brain requires a token (`HERMES_TOKEN`) on every request. **Always set a
-  strong token before exposing it beyond your LAN.**
+  strong token before exposing it beyond your LAN.** Tokens are compared in constant
+  time, and the token endpoints are rate limited per client before the token is
+  checked, so guessing is throttled.
+- Audio uploads are capped (`MAX_AUDIO_BYTES`, default 10 MB) and errors come back
+  as JSON without internal details.
 - Controlling another PC requires the agent running there — by design, no device
   can run commands on another without that opt‑in.
+
+---
+
+## 🧪 Development
+
+```bash
+pip install -r requirements-dev.txt
+ruff check .
+pytest
+```
+
+Tests mock every provider (Gnani, Groq, NVIDIA, Evon) at the HTTP layer and run on Linux.
+CI runs ruff, pytest on Python 3.11 and 3.12, and a Docker build plus `/health` check.
 
 ---
 
@@ -309,4 +439,5 @@ running, Hermes starts the desktop app and plays on it.
 ## 📜 License
 
 MIT — see [`LICENSE`](LICENSE). Built by [ROHITCRAFTSYT](https://github.com/ROHITCRAFTSYT).
-Uses Groq (Whisper + LLMs), NVIDIA NIM, Google TTS, and the ESP32 Arduino core.
+Uses Gnani.ai (Prisma, Timbre, Evon), Groq (Whisper + LLMs), NVIDIA NIM, Google TTS,
+and the ESP32 Arduino core.

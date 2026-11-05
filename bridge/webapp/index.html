@@ -123,7 +123,7 @@ async function health(){
   try{
     const r = await fetch(API + "/health");
     const j = await r.json();
-    if(!j.brain){ statusEl.className="bad"; statusEl.innerHTML="online, but <b>no Groq key</b> — add it to .env"; }
+    if(!j.brain){ statusEl.className="bad"; statusEl.innerHTML="online, but <b>no LLM key</b> — add one to .env"; }
     else{ statusEl.className=""; statusEl.innerHTML="<b>ready</b> · "+j.llm+(j.auth?" · 🔒":""); }
   }catch(e){ statusEl.className="bad"; statusEl.innerHTML="<b>can't reach brain</b> — is the bridge running?"; }
 }

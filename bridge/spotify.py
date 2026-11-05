@@ -12,14 +12,14 @@ Login uses Authorization Code + PKCE, so no client secret is stored. Tokens are
 kept in spotify_token.json (git-ignored) and refreshed automatically.
 """
 
-import os
-import json
-import time
 import base64
 import hashlib
+import json
+import os
 import secrets
 import socket
 import threading
+import time
 from pathlib import Path
 from urllib.parse import urlencode
 
@@ -110,7 +110,7 @@ def _call(method: str, path: str, **kw):
     except ValueError:   # player commands can answer 200 with a plain-text id instead of JSON
         if r.status_code < 400:
             return {}
-        raise SpotifyError(f"Spotify said: {r.status_code}.")
+        raise SpotifyError(f"Spotify said: {r.status_code}.") from None
     if r.status_code >= 400:
         err = data.get("error", {}) if isinstance(data, dict) else {}
         if err.get("reason") == "PREMIUM_REQUIRED":

@@ -8,36 +8,38 @@ Endpoints:
     POST /chat            app posts {"text": "..."}, gets {"reply": "..."}
     POST /talk            app posts recorded audio, gets {heard, reply, audio_b64}
 
-All POST endpoints require header  X-Hermes-Token  when HERMES_TOKEN is set.
+All POST endpoints require header  X-Hermes-Token  when HERMES_TOKEN is set, and are
+rate limited per client (RATE_LIMIT_PER_MIN).
 
 Run:  .venv\\Scripts\\python hermes_bridge.py
 """
 
-import os
-import json
-import base64
-import io
-import html
-import socket
 import asyncio
+import base64
+import hmac
+import html
+import io
+import json
+import logging
+import math
+import os
+import re
+import socket
+import sys
 import tempfile
 import threading
 import time
-import re
-from datetime import datetime
+import uuid
 import wave
-import sys
+from datetime import datetime
 from pathlib import Path
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, Request, Response, HTTPException
+from fastapi import Depends, FastAPI, HTTPException, Request, Response
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
-import uvicorn
-
-import tools as T
-import spotify as SP
-import timers as TM
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 for _stream in (sys.stdout, sys.stderr):
     try:
@@ -48,22 +50,29 @@ for _stream in (sys.stdout, sys.stderr):
 _HERE = Path(__file__).parent
 _WEBAPP = _HERE / "webapp"
 
-load_dotenv(_HERE / ".env")
+if os.getenv("HERMES_SKIP_DOTENV") != "1":
+    load_dotenv(_HERE / ".env")
 
-GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
-NVIDIA_API_KEY = os.getenv("NVIDIA_API_KEY", "").strip()
-NVIDIA_BASE_URL = os.getenv("NVIDIA_BASE_URL", "https://integrate.api.nvidia.com/v1").rstrip("/")
-NVIDIA_LLM_MODEL = os.getenv("NVIDIA_LLM_MODEL", "nvidia/nemotron-3-super-120b-a12b")
-STT_MODEL = os.getenv("STT_MODEL", "whisper-large-v3-turbo")
-LLM_MODEL = os.getenv("LLM_MODEL", "llama-3.3-70b-versatile")
-PORT = int(os.getenv("PORT", "8787"))
-NAME = os.getenv("ASSISTANT_NAME", "Hermes")
-TOKEN = os.getenv("HERMES_TOKEN", "").strip()
-PLAY_ON_PC = os.getenv("PLAY_ON_PC", "1") == "1"   # speak replies on the PC speakers (no ESP speaker needed)
-LLM_MAX_TOKENS = int(os.getenv("LLM_MAX_TOKENS", "1024"))   # includes reasoning tokens on gpt-oss
-REASONING_EFFORT = os.getenv("REASONING_EFFORT", "low")       # gpt-oss only: low = fast, short thinking
-LLM_RATE_LIMIT_RETRIES = int(os.getenv("LLM_RATE_LIMIT_RETRIES", "2"))
-AGENT_DEADLINE_S = float(os.getenv("AGENT_DEADLINE_S", "12"))   # then answer with what we have (ESP waits 30 s)
+import logs  # noqa: E402
+import providers  # noqa: E402
+import spotify as SP  # noqa: E402
+import timers as TM  # noqa: E402
+import tools as T  # noqa: E402
+from config import load_settings  # noqa: E402
+from providers.llm import is_rate_limit, retry_delay_seconds  # noqa: E402
+from ratelimit import RateLimiter  # noqa: E402
+
+VERSION = "1.1.0"
+S = load_settings()
+logs.setup(S.log_level, S.log_format)
+log = logging.getLogger("hermes")
+
+NAME = S.assistant_name
+TOKEN = S.hermes_token
+PORT = S.port
+PLAY_ON_PC = S.play_on_pc
+AGENT_DEADLINE_S = S.agent_deadline_s
+P = providers.build(S, T.TOOLS_SPEC)
 
 SYSTEM_PROMPT = (
     f"You are {NAME}, a friendly voice assistant that runs the user's smart home, "
@@ -106,19 +115,15 @@ _COMMAND = re.compile(
     r"^\s*(open|play|close|launch|start|turn|switch|set|pause|stop|resume|lock|mute|unmute|"
     r"volume|take|show|go to|cast|remember)\b", re.I)
 
-
 _CRYPTO_PRICE = re.compile(
     r"\b(bitcoin|btc|ethereum|eth|solana|dogecoin|doge|xrp|crypto|cryptocurrency|memecoin|coin|token)s?\b"
     r".*\b(price|worth|cost|value|rate|trading)\b"
     r"|\b(price|worth|cost|value|rate|how much)\b.*"
     r"\b(bitcoin|btc|ethereum|eth|solana|dogecoin|doge|xrp|crypto|cryptocurrency|memecoin|coin|token)s?\b", re.I)
 
-
 _PERSONAL = re.compile(r"\b(my|mine)\b", re.I)
 _MUSIC_QUESTION = re.compile(r"\b(spotify|what'?s playing|what is playing|this song|current song|which song)\b", re.I)
 _PLAY_MUSIC = re.compile(r"^\s*(please\s+|can you\s+|hey\s+\w+,?\s+)?play\b(?!.*\b(youtube|video)s?\b)", re.I)
-
-
 _TIMER_TALK = re.compile(r"\b(timers?|remind(ers?)?|alarms?|wake me)\b", re.I)
 
 
@@ -144,53 +149,118 @@ def _system_prompt(user_text: str) -> str:
     return (f"{SYSTEM_PROMPT} Today is {now:%A, %d %B %Y} and the local time is {now:%I:%M %p}. "
             f"{FRESHNESS_RULE} {T.inventory()} {T.memory_facts()} {_language_hint(user_text)}")
 
-try:
-    from groq import Groq
-    # No silent SDK retries: on a rate limit we'd rather switch to NVIDIA than stall the ESP32.
-    _client = Groq(api_key=GROQ_API_KEY, max_retries=0) if GROQ_API_KEY else None
-    _client_error = ""
-except Exception as e:
-    _client = None
-    _client_error = str(e)
 
-app = FastAPI(title="Hermes Bridge")
+app = FastAPI(title="Hermes Bridge", version=VERSION)
 _AGENT_LOCK = threading.Lock()
+_LIMITER = RateLimiter(S.rate_limit_per_min)
 
 
-# ── Auth ─────────────────────────────────────────────────────────────────────
+# ── Errors, request ids, access log ──────────────────────────────────────────
+
+def _rid(request: Request) -> str:
+    return getattr(request.state, "request_id", "-")
+
+
+def _error(request: Request, status: int, message: str, headers: dict | None = None) -> JSONResponse:
+    # "detail" kept for older clients; "error" is the structured shape.
+    return JSONResponse({"detail": message, "error": {"code": status, "message": message,
+                                                      "request_id": _rid(request)}},
+                        status_code=status, headers=headers)
+
+
+@app.exception_handler(StarletteHTTPException)
+async def _http_error(request: Request, exc: StarletteHTTPException):
+    return _error(request, exc.status_code, str(exc.detail), getattr(exc, "headers", None))
+
+
+@app.exception_handler(RequestValidationError)
+async def _validation_error(request: Request, exc: RequestValidationError):
+    return _error(request, 422, "Invalid request")
+
+
+@app.exception_handler(Exception)
+async def _unhandled(request: Request, exc: Exception):
+    log.error("unhandled error", exc_info=exc, extra={"path": request.url.path})
+    return _error(request, 500, "Internal error")
+
+
+_RID_OK = re.compile(r"^[\w.-]{1,64}$")
+
+
+@app.middleware("http")
+async def _access_log(request: Request, call_next):
+    rid = request.headers.get("x-request-id", "")
+    rid = rid if _RID_OK.match(rid) else uuid.uuid4().hex[:12]
+    request.state.request_id = rid
+    ctx = logs.request_id.set(rid)
+    started = time.perf_counter()
+    try:
+        response = await call_next(request)
+        response.headers["X-Request-ID"] = rid
+        path = request.url.path
+        quiet = path == "/health" or path.startswith("/app")
+        log.log(logging.DEBUG if quiet else logging.INFO, "request", extra={
+            "method": request.method, "path": path, "status": response.status_code,
+            "ms": round((time.perf_counter() - started) * 1000)})
+        return response
+    finally:
+        logs.request_id.reset(ctx)
+
+
+# ── Auth + rate limit ────────────────────────────────────────────────────────
+
+def _client_ip(request: Request) -> str:
+    if S.trust_proxy_headers and (fwd := request.headers.get("x-forwarded-for")):
+        return fwd.split(",")[0].strip()
+    return request.client.host if request.client else "unknown"
+
 
 def _auth(request: Request):
     if not TOKEN:
         return  # LAN mode, no token set
-    sent = request.headers.get("x-hermes-token") or request.query_params.get("token")
-    if sent != TOKEN:
+    sent = request.headers.get("x-hermes-token") or request.query_params.get("token") or ""
+    if not hmac.compare_digest(sent.encode(), TOKEN.encode()):
         raise HTTPException(status_code=401, detail="Invalid or missing token")
+
+
+def guard(request: Request):
+    # Limit before checking the token, so guessing tokens is throttled too.
+    wait = _LIMITER.check(_client_ip(request))
+    if wait is not None:
+        log.warning("rate limited", extra={"client": _client_ip(request), "path": request.url.path})
+        raise HTTPException(status_code=429, detail="Too many requests, slow down",
+                            headers={"Retry-After": str(max(1, math.ceil(wait)))})
+    _auth(request)
+
+
+async def _read_audio(request: Request) -> bytes:
+    declared = request.headers.get("content-length", "")
+    if declared.isdigit() and int(declared) > S.max_audio_bytes:
+        raise HTTPException(status_code=413, detail="Audio too large")
+    body = bytearray()
+    async for chunk in request.stream():
+        body += chunk
+        if len(body) > S.max_audio_bytes:
+            raise HTTPException(status_code=413, detail="Audio too large")
+    if not body:
+        raise HTTPException(status_code=400, detail="Empty audio body")
+    return bytes(body)
 
 
 # ── Speech -> text ───────────────────────────────────────────────────────────
 
-def transcribe(audio: bytes, filename: str = "speech.wav") -> str:
-    if not _client:
+STT_UNAVAILABLE = "I couldn't reach the speech service just now. Please try again."
+
+
+def transcribe(audio: bytes, filename: str = "speech.wav") -> str | None:
+    """Transcript ("" for silence), or None when every STT provider failed."""
+    if not P.stt.providers:
         return ""
-    try:
-        result = _client.audio.transcriptions.create(
-            file=(filename, audio, "application/octet-stream"),
-            model=STT_MODEL,
-        )
-        text = (result.text or "").strip()
-        # Whisper guesses the language per clip and sometimes hears short English as Hindi etc.
-        # Hermes speaks English and Tamil, so anything with neither script is re-run as English.
-        if text and not re.search(r"[A-Za-z஀-௿]", text):
-            print(f"   [STT] heard {text!r} (not English/Tamil) — retrying as English")
-            result = _client.audio.transcriptions.create(
-                file=(filename, audio, "application/octet-stream"),
-                model=STT_MODEL, language="en",
-            )
-            text = (result.text or "").strip() or text
-        return text
-    except Exception as e:
-        print("   [STT] failed:", _compact_error(e))
-        return ""
+    text, used = P.stt.transcribe(audio, filename)
+    if used is None:
+        return None
+    log.info("transcribed", extra={"stt": used, "chars": len(text)})
+    return text
 
 
 # ── Short-term conversation memory (remembers the last few turns) ────────────
@@ -215,8 +285,8 @@ def _save_convo():
     try:
         _CONVO_PATH.write_text(json.dumps(CONVO[-_CONVO_MAX:], ensure_ascii=False, indent=2),
                                encoding="utf-8")
-    except Exception:
-        pass
+    except Exception as e:
+        log.warning("couldn't save conversation", extra={"error": str(e)})
 
 
 def _has_tamil(text: str) -> bool:
@@ -236,132 +306,14 @@ def _compact_error(exc: Exception) -> str:
     return text[:500] if text else exc.__class__.__name__
 
 
-def _retry_delay_seconds(exc: Exception) -> float | None:
-    text = str(exc)
-    m = re.search(r"try again in (?:(\d+)m)?\s*([\d.]+)s", text, re.I)
-    if not m:
-        return None
-    minutes = int(m.group(1) or 0)
-    seconds = float(m.group(2))
-    return minutes * 60 + seconds
-
-
 def _model_error_reply(exc: Exception) -> str:
-    delay = _retry_delay_seconds(exc)
-    text = str(exc).lower()
-    if "rate_limit" in text or "rate limit" in text or delay is not None:
+    if is_rate_limit(exc):
+        delay = retry_delay_seconds(exc)
         if delay and delay >= 60:
             mins = max(1, round(delay / 60))
             return f"My model limit is full right now. Please try again in about {mins} minutes."
         return "My model limit is busy for a moment. Please try again in a few seconds."
     return "My brain hit an error while thinking. Please try again."
-
-
-def _is_rate_limit(exc: Exception) -> bool:
-    text = str(exc).lower()
-    return "rate_limit" in text or "rate limit" in text or _retry_delay_seconds(exc) is not None
-
-
-def _tool_args(force: str | None) -> dict:
-    # force=None: model may pick a tool; a tool name: must call it; "none": no tools offered at all
-    # (some providers ignore tool_choice="none", so the tools are left out entirely).
-    if force == "none":
-        return {}
-    choice = {"type": "function", "function": {"name": force}} if force else "auto"
-    return {"tools": T.TOOLS_SPEC, "tool_choice": choice}
-
-
-def _reasoning_args(model: str) -> dict:
-    # gpt-oss thinks before answering; unchecked, the thinking eats the whole token budget.
-    return {"reasoning_effort": REASONING_EFFORT} if "gpt-oss" in model.lower() and REASONING_EFFORT else {}
-
-
-def _groq_chat(messages: list[dict], force: str | None = None) -> dict:
-    if not _client:
-        raise RuntimeError(_client_error or "Groq client is not configured")
-    resp = _client.chat.completions.create(
-        model=LLM_MODEL, messages=messages,
-        **_tool_args(force),
-        temperature=0.4, max_tokens=LLM_MAX_TOKENS, **_reasoning_args(LLM_MODEL),
-    )
-    msg = resp.choices[0].message
-    return {
-        "provider": "groq",
-        "content": msg.content or "",
-        "tool_calls": [{
-            "id": tc.id,
-            "name": tc.function.name,
-            "arguments": tc.function.arguments or "{}",
-        } for tc in (msg.tool_calls or [])],
-    }
-
-
-def _nvidia_chat(messages: list[dict], force: str | None = None) -> dict:
-    if not NVIDIA_API_KEY:
-        raise RuntimeError("NVIDIA API key is not configured")
-    import httpx
-    payload = {
-        "model": NVIDIA_LLM_MODEL,
-        "messages": messages,
-        **_tool_args(force),
-        "temperature": 0.4,
-        "max_tokens": LLM_MAX_TOKENS,
-        "stream": False,
-        **_reasoning_args(NVIDIA_LLM_MODEL),
-    }
-    # retries=2 re-sends on connection resets (WinError 10054), not on HTTP errors.
-    r = httpx.Client(transport=httpx.HTTPTransport(retries=2)).post(
-        NVIDIA_BASE_URL + "/chat/completions",
-        headers={
-            "Authorization": f"Bearer {NVIDIA_API_KEY}",
-            "Content-Type": "application/json",
-        },
-        json=payload,
-        timeout=60,
-    )
-    if r.status_code >= 400:
-        raise RuntimeError(f"NVIDIA returned {r.status_code}: {r.text[:500]}")
-    data = r.json()
-    msg = data.get("choices", [{}])[0].get("message", {}) or {}
-    calls = []
-    for i, tc in enumerate(msg.get("tool_calls") or []):
-        fn = tc.get("function", {}) or {}
-        calls.append({
-            "id": tc.get("id") or f"nvidia_tool_{i}",
-            "name": fn.get("name", ""),
-            "arguments": fn.get("arguments") or "{}",
-        })
-    return {"provider": "nvidia", "content": msg.get("content") or "", "tool_calls": calls}
-
-
-def _chat_completion(messages: list[dict], force: str | None = None) -> dict:
-    last_error: Exception | None = None
-    if _client:
-        for attempt in range(LLM_RATE_LIMIT_RETRIES + 1):
-            try:
-                return _groq_chat(messages, force)
-            except Exception as e:
-                last_error = e
-                if _is_rate_limit(e) and NVIDIA_API_KEY:
-                    print("   [LLM] Groq rate-limited; using NVIDIA fallback.")
-                    break
-                delay = _retry_delay_seconds(e)
-                if delay is not None and delay <= 8 and attempt < LLM_RATE_LIMIT_RETRIES:
-                    time.sleep(max(0.5, delay + 0.25))
-                    continue
-                raise
-
-    if NVIDIA_API_KEY:
-        try:
-            return _nvidia_chat(messages, force)
-        except Exception as e:
-            if last_error:
-                raise RuntimeError(f"Groq failed: {_compact_error(last_error)}; NVIDIA failed: {_compact_error(e)}")
-            raise
-
-    if last_error:
-        raise last_error
-    raise RuntimeError("No LLM provider is configured")
 
 
 # ── The agent loop ───────────────────────────────────────────────────────────
@@ -371,11 +323,18 @@ def run_agent(user_text: str) -> str:
         return _run_agent_locked(user_text)
 
 
+def _remember(user_text: str, reply: str):
+    global CONVO
+    CONVO.append({"role": "user", "content": user_text})
+    CONVO.append({"role": "assistant", "content": reply})
+    CONVO = CONVO[-_CONVO_MAX:]
+    _save_convo()
+
+
 def _run_agent_locked(user_text: str) -> str:
     global CONVO
-    if not _client and not NVIDIA_API_KEY:
-        detail = f" ({_client_error})" if _client_error else ""
-        return "My brain isn't connected yet. Please add a Groq or NVIDIA A P I key to the dot env file." + detail
+    if not P.llm:
+        return "My brain isn't connected yet. Please add a Groq, NVIDIA or Evon setting to the dot env file."
     if not any(c.isalnum() for c in user_text or ""):   # empty, or Whisper heard only "." on silence
         return "Sorry, I didn't catch that."
 
@@ -397,29 +356,27 @@ def _run_agent_locked(user_text: str) -> str:
             force = "none"   # out of time: no more tools, answer from what we have
         try:
             try:
-                msg = _chat_completion(messages, force)
+                msg = P.llm.chat(messages, force)
             except Exception as e:
-                if not force or force == "none" or _is_rate_limit(e):
+                if not force or force == "none" or is_rate_limit(e):
                     raise
-                msg = _chat_completion(messages)   # provider refused a forced tool call; let the model choose
+                msg = P.llm.chat(messages)   # provider refused a forced tool call; let the model choose
             if force == "none" and msg["tool_calls"]:
                 # Some models (NVIDIA nemotron) emit tool calls even when none are offered — never run them.
                 msg["tool_calls"] = []
                 if not (msg["content"] or "").strip():
                     messages.append({"role": "system", "content": "Answer the user now in one or two "
                                      "sentences from the information above. Do not call any tools."})
-                    msg = _chat_completion(messages, "none")
+                    msg = P.llm.chat(messages, "none")
                     msg["tool_calls"] = []
                 if not (msg["content"] or "").strip():
                     msg["content"] = "Sorry, I couldn't finish looking that up in time. Please ask again."
         except Exception as e:
-            print("   [LLM] failed:", _compact_error(e))
+            log.error("llm failed", extra={"error": _compact_error(e)})
             reply = _model_error_reply(e)
-            CONVO.append({"role": "user", "content": user_text})
-            CONVO.append({"role": "assistant", "content": reply})
-            CONVO = CONVO[-_CONVO_MAX:]
-            _save_convo()
+            _remember(user_text, reply)
             return reply
+        log.debug("llm step", extra={"step": step, "llm": msg.get("provider"), "tools": len(msg["tool_calls"])})
         if not msg["tool_calls"]:
             reply = (msg["content"] or "Okay.").strip()
             break
@@ -435,38 +392,34 @@ def _run_agent_locked(user_text: str) -> str:
                 args = json.loads(tc["arguments"] or "{}")
             except json.JSONDecodeError:
                 args = {}
+            if not isinstance(args, dict):
+                args = {}
             result = T.dispatch(tc["name"], args)
-            print(f"   tool  {tc['name']}({args}) -> {result[:120]}")
+            log.info("tool", extra={"tool": tc["name"], "tool_args": args, "result": result[:120]})
             messages.append({"role": "tool", "tool_call_id": tc["id"],
                              "name": tc["name"], "content": result})
     else:
         reply = "That took too many steps, let's try again."
 
     # Remember the clean exchange (not the tool plumbing) for next time.
-    CONVO.append({"role": "user", "content": user_text})
-    CONVO.append({"role": "assistant", "content": reply})
-    CONVO = CONVO[-_CONVO_MAX:]
-    _save_convo()
-    reply = reply.replace(" ", " ").replace(" ", " ")   # model emits narrow no-break spaces
+    _remember(user_text, reply)
+    reply = reply.replace(" ", " ").replace(" ", " ")   # model emits narrow no-break spaces
     return re.sub(r"(?<=[a-zA-Z0-9])\.(?=[A-Z])", ". ", reply)
 
 
 # ── Text -> speech ───────────────────────────────────────────────────────────
-# Neural voices from Microsoft's Edge "Read aloud" service (free, no key; English + Tamil).
-# Falls back to the offline Windows voice (gTTS for Tamil) when it's unreachable or slow.
+# Order comes from TTS_PROVIDER: Gnani Timbre, Microsoft Edge neural voices (free, no key),
+# gTTS, then the offline Windows voice. Each one falls through to the next on failure.
 
-TTS_ENGINE = os.getenv("TTS_ENGINE", "edge").lower()          # edge | sapi
-TTS_VOICE = os.getenv("TTS_VOICE", "en-US-AvaMultilingualNeural")
-TTS_VOICE_TA = os.getenv("TTS_VOICE_TA", "ta-IN-PallaviNeural")
-TTS_RATE = os.getenv("TTS_RATE", "+0%")                        # e.g. +10% to speak faster
-TTS_HEDGE_S = float(os.getenv("TTS_HEDGE_S", "2.5"))     # no audio by then: race a second connection
-TTS_TOTAL_S = float(os.getenv("TTS_TOTAL_S", "8"))        # then give up and use the fallback voice
+TTS_VOICE = S.tts_voice
+TTS_VOICE_TA = S.tts_voice_ta
+TTS_RATE = S.tts_rate
+TTS_HEDGE_S = S.tts_hedge_s     # no audio by then: race a second connection
+TTS_TOTAL_S = S.tts_total_s     # then give up and use the fallback voice
 _TTS_CACHE: dict[tuple, bytes] = {}   # repeated phrases ("Sorry, I didn't catch that.") skip the network
 
 
 def _edge_mp3(text: str) -> bytes | None:
-    if TTS_ENGINE != "edge":
-        return None
     voice = TTS_VOICE_TA if _has_tamil(text) else TTS_VOICE
     key = (voice, TTS_RATE, text)
     if key in _TTS_CACHE:
@@ -494,6 +447,7 @@ def _edge_mp3(text: str) -> bytes | None:
         # Some requests stall with no audio at all while a fresh one is fine (often on mobile
         # hotspots). If the first audio is late, race a second connection; keep whichever finishes.
         tasks, events = [], []
+
         def launch():
             events.append(asyncio.Event())
             tasks.append(asyncio.create_task(fetch(events[-1])))
@@ -519,15 +473,13 @@ def _edge_mp3(text: str) -> bytes | None:
         mp3 = asyncio.run(hedged())   # always called from a worker thread
     except Exception as e:
         mp3 = None
-        print("   [TTS] neural voice error:", _compact_error(e))
+        log.warning("edge voice error", extra={"error": _compact_error(e)})
     if not mp3:
-        print("   [TTS] neural voice unavailable, using fallback")
         return None
-    if mp3:
-        if len(_TTS_CACHE) > 64:
-            _TTS_CACHE.clear()
-        _TTS_CACHE[key] = mp3
-    return mp3 or None
+    if len(_TTS_CACHE) > 64:
+        _TTS_CACHE.clear()
+    _TTS_CACHE[key] = mp3
+    return mp3
 
 
 def _mp3_to_wav(mp3: bytes) -> bytes:
@@ -554,22 +506,20 @@ def _gtts_mp3(text: str) -> bytes:
 def render_speech(text: str) -> tuple[bytes | None, bytes]:
     """Synthesize a reply ONCE: (MP3 for the PC speakers, or None) and a WAV for the ESP32 / app."""
     text = text or "Okay."
-    mp3 = _edge_mp3(text)
-    if mp3 is None and (TTS_ENGINE == "edge" or _has_tamil(text)):   # smoother than Windows; speaks Tamil
+    for engine in S.tts_chain():
         try:
-            mp3 = _gtts_mp3(text)
+            if engine == "gnani" and P.timbre:
+                return None, P.timbre.synthesize(text)
+            if engine == "edge" and (mp3 := _edge_mp3(text)):
+                return mp3, _mp3_to_wav(mp3)
+            if engine == "gtts" and (S.tts_provider != "sapi" or _has_tamil(text)):
+                mp3 = _gtts_mp3(text)
+                return mp3, _mp3_to_wav(mp3)
+            if engine == "sapi":
+                return None, _sapi_wav(text)
         except Exception as e:
-            print("   [TTS] gTTS failed:", _compact_error(e))
-    if mp3:
-        try:
-            return mp3, _mp3_to_wav(mp3)
-        except Exception as e:
-            print("   [TTS] couldn't decode MP3:", _compact_error(e))
-    try:
-        return None, _sapi_wav(text)
-    except Exception as e:
-        print("   [TTS] failed:", _compact_error(e))
-        return None, _silence_wav()
+            log.warning("tts engine failed", extra={"tts": engine, "error": _compact_error(e)})
+    return None, _silence_wav()
 
 
 def synthesize(text: str) -> bytes:
@@ -587,29 +537,34 @@ def _warm_up_tts():
 
 def _sapi_wav(text: str) -> bytes:
     text = text or "Okay."
+    fd, tmp = tempfile.mkstemp(suffix=".wav")
+    os.close(fd)
     try:
-        import pythoncom, win32com.client
-        pythoncom.CoInitialize()
-        tmp = tempfile.mktemp(suffix=".wav")
-        stream = win32com.client.Dispatch("SAPI.SpFileStream")
-        stream.Open(tmp, 3)
-        voice = win32com.client.Dispatch("SAPI.SpVoice")
-        voice.AudioOutputStream = stream
-        voice.Speak(text)
-        stream.Close()
+        try:
+            import pythoncom
+            import win32com.client
+            pythoncom.CoInitialize()
+            stream = win32com.client.Dispatch("SAPI.SpFileStream")
+            stream.Open(tmp, 3)
+            voice = win32com.client.Dispatch("SAPI.SpVoice")
+            voice.AudioOutputStream = stream
+            voice.Speak(text)
+            stream.Close()
+        except Exception as e:
+            log.info("SAPI unavailable, trying pyttsx3", extra={"error": str(e)[:200]})
+            import pyttsx3
+            eng = pyttsx3.init()
+            eng.save_to_file(text, tmp)
+            eng.runAndWait()
         data = Path(tmp).read_bytes()
-        os.remove(tmp)
+        if not data:
+            raise RuntimeError("offline voice produced no audio")
         return data
-    except Exception as e:
-        print("   [TTS] SAPI failed, trying pyttsx3:", e)
-        import pyttsx3
-        tmp = tempfile.mktemp(suffix=".wav")
-        eng = pyttsx3.init()
-        eng.save_to_file(text, tmp)
-        eng.runAndWait()
-        data = Path(tmp).read_bytes()
-        os.remove(tmp)
-        return data
+    finally:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
 
 
 _LAST_REPLY_FILE = {"path": None}
@@ -621,7 +576,6 @@ def play_on_pc(mp3: bytes | None, wav: bytes):
         return
     try:
         import ctypes
-        import uuid
         import winsound
         winmm = ctypes.windll.winmm
         winmm.mciSendStringW("close hsnd", None, 0, 0)    # a new reply interrupts the previous one
@@ -642,7 +596,7 @@ def play_on_pc(mp3: bytes | None, wav: bytes):
         else:
             winsound.PlaySound(path, winsound.SND_FILENAME | winsound.SND_ASYNC)
     except Exception as e:
-        print("   [PC audio] could not play:", e)
+        log.warning("could not play on PC", extra={"error": str(e)})
 
 
 def speak_on_pc(text: str):
@@ -653,7 +607,7 @@ def speak_on_pc(text: str):
 
 def announce_timer(text: str, kind: str):
     """A timer/reminder/alarm is due: chime (three times for alarms), then say it."""
-    print(f"\n── {kind} ── {text}")
+    log.info("timer due", extra={"kind": kind, "text": text})
     if not PLAY_ON_PC:
         return
     try:
@@ -663,24 +617,17 @@ def announce_timer(text: str, kind: str):
             winsound.PlaySound(TM.chime_path(), winsound.SND_FILENAME)
         play_on_pc(mp3, wav)
     except Exception as e:
-        print("   [timer] couldn't announce:", e)
+        log.warning("couldn't announce timer", extra={"error": str(e)})
 
 
 def _silence_wav(seconds: float = 0.35, sample_rate: int = 16000) -> bytes:
-    tmp = tempfile.mktemp(suffix=".wav")
-    try:
-        frames = b"\x00\x00" * int(seconds * sample_rate)
-        with wave.open(tmp, "wb") as w:
-            w.setnchannels(1)
-            w.setsampwidth(2)
-            w.setframerate(sample_rate)
-            w.writeframes(frames)
-        return Path(tmp).read_bytes()
-    finally:
-        try:
-            os.remove(tmp)
-        except OSError:
-            pass
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(sample_rate)
+        w.writeframes(b"\x00\x00" * int(seconds * sample_rate))
+    return buf.getvalue()
 
 
 def _ext_for(content_type: str) -> str:
@@ -692,18 +639,21 @@ def _ext_for(content_type: str) -> str:
     return "wav"
 
 
+def _hear_and_reply(audio: bytes, filename: str) -> tuple[str, str]:
+    heard = transcribe(audio, filename)
+    reply = STT_UNAVAILABLE if heard is None else run_agent(heard)
+    log.info("turn", extra={"heard": heard, "reply": reply})
+    return heard or "", reply
+
+
 # ── Endpoints ────────────────────────────────────────────────────────────────
 
-@app.post("/voice")
+@app.post("/voice", dependencies=[Depends(guard)])
 async def voice(request: Request):
-    _auth(request)
-    audio = await request.body()
-    print(f"\n── /voice ── {len(audio)} bytes")
+    audio = await _read_audio(request)
+
     def work(a):
-        heard = transcribe(a)
-        reply = run_agent(heard)
-        print(f"   heard: {heard!r}")
-        print(f"   reply: {reply!r}")
+        _, reply = _hear_and_reply(a, "speech.wav")
         mp3, wav = render_speech(reply)   # synthesize once: WAV for the ESP32, MP3 for the PC
         play_on_pc(mp3, wav)              # speak it on the PC (no ESP speaker needed)
         return wav
@@ -711,38 +661,36 @@ async def voice(request: Request):
     return Response(content=wav, media_type="audio/wav")
 
 
-@app.post("/chat")
+@app.post("/chat", dependencies=[Depends(guard)])
 async def chat(request: Request):
-    _auth(request)
     try:
         body = await request.json()
     except Exception:
-        raise HTTPException(status_code=400, detail="Expected JSON body")
+        raise HTTPException(status_code=400, detail="Expected JSON body") from None
+    if not isinstance(body, dict) or not isinstance(body.get("text", ""), str):
+        raise HTTPException(status_code=400, detail='Expected {"text": "..."}')
     text = (body.get("text") or "").strip()
-    print(f"\n── /chat ── {text!r}")
+    if len(text) > S.max_text_chars:
+        raise HTTPException(status_code=413, detail="Text too long")
     reply = await asyncio.to_thread(run_agent, text)
-    print(f"   reply: {reply!r}")
+    log.info("turn", extra={"text": text, "reply": reply})
     # Speak it on the PC in the background: the app shows the text without waiting for the voice.
     threading.Thread(target=speak_on_pc, args=(reply,), daemon=True).start()
     return JSONResponse({"reply": reply})
 
 
-@app.post("/talk")
+@app.post("/talk", dependencies=[Depends(guard)])
 async def talk(request: Request):
-    _auth(request)
-    audio = await request.body()
+    audio = await _read_audio(request)
     ext = _ext_for(request.headers.get("content-type", ""))
-    print(f"\n── /talk ── {len(audio)} bytes ({ext})")
 
     def work(a, e):
-        heard = transcribe(a, filename=f"speech.{e}")
-        reply = run_agent(heard)
+        heard, reply = _hear_and_reply(a, f"speech.{e}")
         mp3, wav = render_speech(reply)
         play_on_pc(mp3, wav)              # also speak it aloud on the PC
         return heard, reply, base64.b64encode(wav).decode()
 
     heard, reply, audio_b64 = await asyncio.to_thread(work, audio, ext)
-    print(f"   heard: {heard!r}  reply: {reply!r}")
     return JSONResponse({"heard": heard, "reply": reply, "audio_b64": audio_b64})
 
 
@@ -764,22 +712,27 @@ async def spotify_login(request: Request):
 async def spotify_callback(request: Request, code: str = "", state: str = "", error: str = ""):
     _local_only(request)
     if error or not code:
-        return HTMLResponse(f"<h2>Spotify login cancelled ({error or 'no code'}).</h2>", 400)
+        return HTMLResponse(f"<h2>Spotify login cancelled ({html.escape(error or 'no code')}).</h2>", 400)
     try:
         await asyncio.to_thread(SP.finish_login, code, state)
     except Exception as e:
         return HTMLResponse(f"<h2>Spotify login failed</h2><p>{html.escape(str(e))}</p>", 400)
-    print("   [Spotify] connected ✅")
+    log.info("spotify connected")
     return HTMLResponse("<h2>Spotify connected ✅</h2><p>You can close this tab and ask Hermes to play a song.</p>")
+
+
+def _llm_label() -> str:
+    models = {"groq": S.llm_model, "nvidia": S.nvidia_llm_model, "evon": S.evon_model}
+    return models[P.llm.names[0]] if P.llm.names else "none"
 
 
 @app.get("/health")
 async def health():
-    return {"ok": True, "name": NAME, "brain": bool(_client or NVIDIA_API_KEY),
-            "auth": bool(TOKEN), "stt": STT_MODEL, "llm": LLM_MODEL,
-            "groq": bool(_client), "voice_stt": bool(_client),
-            "nvidia": bool(NVIDIA_API_KEY), "nvidia_llm": NVIDIA_LLM_MODEL,
-            "max_tokens": LLM_MAX_TOKENS}
+    tts = [e for e in S.tts_chain() if e != "gnani" or P.timbre]
+    return {"ok": True, "version": VERSION, "name": NAME, "auth": bool(TOKEN),
+            "brain": bool(P.llm), "llm": _llm_label(), "stt": S.stt_model,
+            "providers": {"stt": P.stt.names, "llm": P.llm.names, "tts": tts},
+            "max_tokens": S.llm_max_tokens}
 
 
 @app.get("/")
@@ -796,7 +749,8 @@ if _WEBAPP.exists():
 def _local_ip() -> str:
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
-        s.connect(("8.8.8.8", 80)); return s.getsockname()[0]
+        s.connect(("8.8.8.8", 80))
+        return s.getsockname()[0]
     except Exception:
         return "127.0.0.1"
     finally:
@@ -805,31 +759,41 @@ def _local_ip() -> str:
 
 def advertise(ip: str):
     try:
-        from zeroconf import Zeroconf, ServiceInfo
+        from zeroconf import ServiceInfo, Zeroconf
         info = ServiceInfo("_hermes._tcp.local.", "Hermes Bridge._hermes._tcp.local.",
                            addresses=[socket.inet_aton(ip)], port=PORT,
                            server="hermes.local.",
                            properties={"path": "/voice"})
-        zc = Zeroconf(); zc.register_service(info)
+        zc = Zeroconf()
+        zc.register_service(info)
         return zc
     except Exception as e:
-        print("   [mDNS] not advertising:", e)
+        log.warning("mDNS not advertising", extra={"error": str(e)})
         return None
 
 
-if __name__ == "__main__":
+def main():
+    import uvicorn
     ip = _local_ip()
     print("=" * 62)
-    print(f"  {NAME} bridge")
-    print(f"  Brain (Groq)  : {'connected ✅' if _client else 'MISSING ❌  add key to .env'}")
+    print(f"  {NAME} bridge {VERSION}")
+    print(f"  Speech-to-text: {' -> '.join(P.stt.names) or 'MISSING ❌  add GROQ_API_KEY or GNANI_API_KEY'}")
+    print(f"  Brain (LLM)   : {' -> '.join(P.llm.names) or 'MISSING ❌  add a key to .env'}  [{_llm_label()}]")
+    print(f"  Voice (TTS)   : {' -> '.join(e for e in S.tts_chain() if e != 'gnani' or P.timbre)}")
     print(f"  Auth token    : {'ON 🔒' if TOKEN else 'off (LAN only — set HERMES_TOKEN before exposing!)'}")
     if SP.client_id():
-        print(f"  Spotify       : {'connected ✅' if SP.is_connected() else f'not linked — open http://127.0.0.1:{PORT}/spotify/login on this PC'}")
-    print(f"  Voice         : {TTS_VOICE if TTS_ENGINE == 'edge' else 'Windows (offline)'}")
+        link = f"not linked — open http://127.0.0.1:{PORT}/spotify/login on this PC"
+        print(f"  Spotify       : {'connected ✅' if SP.is_connected() else link}")
     print(f"  On this LAN   : http://{ip}:{PORT}/app/   (open on your phone)")
     print(f"  ESP config.h  : BRIDGE_HOST \"{ip}\"  (or leave USE_MDNS 1)")
     print("=" * 62)
+    for w in S.warnings():
+        log.warning(w)
     threading.Thread(target=_warm_up_tts, daemon=True).start()
     TM.start(announce_timer)   # timers/reminders/alarms, including any that came due while off
     advertise(ip)
-    uvicorn.run(app, host="0.0.0.0", port=PORT, log_level="warning")
+    uvicorn.run(app, host="0.0.0.0", port=PORT, log_level="warning", timeout_graceful_shutdown=5)
+
+
+if __name__ == "__main__":
+    main()

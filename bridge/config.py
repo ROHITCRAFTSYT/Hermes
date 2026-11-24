@@ -32,7 +32,7 @@ class Settings(BaseSettings):
 
     # provider selection: the first one, then the rest of the chain as fallback
     stt_provider: Literal["groq", "gnani"] = "groq"
-    llm_provider: Literal["groq", "nvidia", "evon"] = "groq"
+    llm_provider: Literal["groq", "nvidia", "evon", "local"] = "groq"
     tts_provider: Literal["edge", "gnani", "sapi"] = Field(
         "edge", validation_alias=AliasChoices("tts_provider", "tts_engine"))
 
@@ -52,7 +52,7 @@ class Settings(BaseSettings):
     # NVIDIA NIM (OpenAI-compatible)
     nvidia_api_key: str = ""
     nvidia_base_url: str = "https://integrate.api.nvidia.com/v1"
-    nvidia_llm_model: str = "nvidia/nemotron-3-super-120b-a12b"
+    nvidia_llm_model: str = "nvidia/nemotron-3.5-super-vl-120b-a12b"   # 3-super was retired 2026-10-03
 
     # Gnani Vachana platform: Prisma STT + Timbre TTS
     gnani_api_key: str = ""
@@ -69,6 +69,13 @@ class Settings(BaseSettings):
     evon_api_key: str = ""
     evon_model: str = "gnani/gnani-evon-v3.3-30B-A3B"
 
+    # A model on this PC: Ollama, LM Studio, llama.cpp — any OpenAI-compatible server.
+    # Off until LOCAL_LLM_MODEL is set. Local models on a CPU can be slow, hence the own timeout.
+    local_llm_base_url: str = "http://localhost:11434/v1"
+    local_llm_model: str = ""
+    local_llm_api_key: str = ""
+    local_llm_timeout_s: float = Field(90.0, gt=0, le=600)
+
     # Edge neural voices
     tts_voice: str = "en-US-AvaMultilingualNeural"
     tts_voice_ta: str = "ta-IN-PallaviNeural"
@@ -81,7 +88,7 @@ class Settings(BaseSettings):
     def _blank_effort(cls, v):
         return None if v in ("", "none", "off") else v
 
-    @field_validator("nvidia_base_url", "gnani_base_url", "evon_base_url")
+    @field_validator("nvidia_base_url", "gnani_base_url", "evon_base_url", "local_llm_base_url")
     @classmethod
     def _url(cls, v: str) -> str:
         v = v.strip().rstrip("/")
@@ -104,7 +111,8 @@ class Settings(BaseSettings):
             raise ValueError("expected 'auto' or a code like hi-IN")
         return v
 
-    @field_validator("hermes_token", "groq_api_key", "nvidia_api_key", "gnani_api_key", "evon_api_key")
+    @field_validator("hermes_token", "groq_api_key", "nvidia_api_key", "gnani_api_key", "evon_api_key",
+                     "local_llm_api_key", "local_llm_model")
     @classmethod
     def _strip(cls, v: str) -> str:
         return v.strip()
@@ -117,8 +125,8 @@ class Settings(BaseSettings):
 
     def llm_chain(self) -> list[str]:
         have = {"groq": bool(self.groq_api_key), "nvidia": bool(self.nvidia_api_key),
-                "evon": bool(self.evon_base_url)}
-        order = [self.llm_provider] + [p for p in ("groq", "nvidia", "evon") if p != self.llm_provider]
+                "evon": bool(self.evon_base_url), "local": bool(self.local_llm_model)}
+        order = [self.llm_provider] + [p for p in ("groq", "nvidia", "evon", "local") if p != self.llm_provider]
         return [p for p in order if have[p]]
 
     def tts_chain(self) -> list[str]:
@@ -137,10 +145,12 @@ class Settings(BaseSettings):
             out.append("TTS_PROVIDER=gnani but GNANI_API_KEY is empty; using Edge voices")
         if self.llm_provider == "evon" and not self.evon_base_url:
             out.append("LLM_PROVIDER=evon but EVON_BASE_URL is empty; using Groq/NVIDIA")
+        if self.llm_provider == "local" and not self.local_llm_model:
+            out.append("LLM_PROVIDER=local but LOCAL_LLM_MODEL is empty; using Groq/NVIDIA")
         if not self.stt_chain():
             out.append("no speech-to-text key set (GROQ_API_KEY or GNANI_API_KEY); voice input won't work")
         if not self.llm_chain():
-            out.append("no LLM configured (GROQ_API_KEY, NVIDIA_API_KEY or EVON_BASE_URL)")
+            out.append("no LLM configured (GROQ_API_KEY, NVIDIA_API_KEY, EVON_BASE_URL or LOCAL_LLM_MODEL)")
         if not self.hermes_token:
             out.append("HERMES_TOKEN is empty: fine on a home LAN, never expose the bridge like this")
         return out

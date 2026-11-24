@@ -47,6 +47,10 @@ def build(s: Settings, tools_spec: list) -> Providers:
         elif name == "evon":
             llm.append(OpenAICompatLLM("evon", s.evon_base_url, s.evon_api_key, s.evon_model,
                                        s.llm_max_tokens, http, retries=1))
+        elif name == "local":
+            llm.append(OpenAICompatLLM("local", s.local_llm_base_url, s.local_llm_api_key, s.local_llm_model,
+                                       s.llm_max_tokens, net.make_client(s.local_llm_timeout_s), retries=0,
+                                       reasoning_effort=s.reasoning_effort))
 
     timbre = None
     if "gnani" in s.tts_chain():

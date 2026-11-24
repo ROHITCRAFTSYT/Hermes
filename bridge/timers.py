@@ -223,6 +223,28 @@ def handle(action: str, kind: str = "", label: str = "", hours: float = 0, minut
     return "I can set, list, or cancel timers, reminders and alarms."
 
 
+def active() -> list[dict]:
+    """Pending timers/reminders/alarms for the web app, soonest first."""
+    now = time.time()
+    with _LOCK:
+        items = _load()
+    return [{"id": i["id"], "kind": i["kind"], "label": i.get("label") or "", "due": i["due"],
+             "repeat": i.get("repeat") or "", "text": _describe(i, now)}
+            for i in sorted(items, key=lambda i: i["due"])]
+
+
+def cancel_id(item_id: str) -> bool:
+    """Cancel one item by id (the app's ✕ button). True if it existed."""
+    with _LOCK:
+        items = _load()
+        keep = [i for i in items if i["id"] != item_id]
+        if len(keep) == len(items):
+            return False
+        _save(keep)
+    _WAKE.set()
+    return True
+
+
 # ── the scheduler ────────────────────────────────────────────────────────────
 
 def _run():

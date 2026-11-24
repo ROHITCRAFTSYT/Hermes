@@ -1,5 +1,6 @@
 """Chat-completion providers: Groq, NVIDIA NIM and Gnani Evon, behind one fallback chain."""
 
+import json
 import logging
 import re
 import time
@@ -57,7 +58,7 @@ class GroqLLM:
 
 
 class OpenAICompatLLM:
-    """Any /v1/chat/completions endpoint. Used for NVIDIA NIM and for Gnani Evon.
+    """Any /v1/chat/completions endpoint. Used for NVIDIA NIM, Gnani Evon and local models (Ollama etc.).
 
     Evon (HF gnani/gnani-evon-v3.3-30B-A3B) has no Gnani-hosted chat API that I could find
     documented, so EVON_BASE_URL points at wherever you serve it, e.g. vLLM with
@@ -90,8 +91,10 @@ class OpenAICompatLLM:
         calls = []
         for i, tc in enumerate(msg.get("tool_calls") or []):
             fn = tc.get("function") or {}
+            args = fn.get("arguments") or "{}"
             calls.append({"id": tc.get("id") or f"{self.name}_tool_{i}", "name": fn.get("name", ""),
-                          "arguments": fn.get("arguments") or "{}"})
+                          # Ollama sends arguments as an object, not a JSON string
+                          "arguments": args if isinstance(args, str) else json.dumps(args)})
         content = _THINK.sub("", msg.get("content") or "").strip()
         return {"provider": self.name, "content": content, "tool_calls": calls}
 

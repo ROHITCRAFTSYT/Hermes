@@ -158,7 +158,7 @@ async function sendText(text){
     if(r.status===401){ t.remove(); openCfg("Wrong or missing token."); return; }
     const j = await readJson(r);
     t.textContent = j.reply || j.detail || "No reply.";
-    if(j.audio_b64) playB64(j.audio_b64);
+    if(j.audio_b64 && speakHere) playB64(j.audio_b64);   // 🔈 may have been turned off meanwhile
     refreshTimers();
   }catch(e){ t.textContent = "Couldn't reach the brain: " + e.message; }
 }
@@ -219,12 +219,16 @@ speakBtn.onclick = ()=>{ speakHere=!speakHere; localStorage.setItem("hermes_spea
 showSpeak();
 
 // ── conversation history & new chat ──
+// Bumped on every successful reset: a /history reply that started before it is stale and dropped,
+// so it can't paint the old conversation back over "New conversation".
+let historyGen = 0;
 async function loadHistory(){
+  const gen = historyGen;
   try{
     const r = await fetch(API+"/history",{headers:headers()});
     if(!r.ok) return;
     const j = await r.json();
-    if(!(j.messages||[]).length) return;
+    if(gen !== historyGen || !(j.messages||[]).length) return;
     log.replaceChildren();
     j.messages.forEach(m=>add(m.content, m.role==="user"?"me":"bot"));
   }catch(e){}
@@ -233,6 +237,11 @@ document.getElementById("newchat").onclick = async ()=>{
   try{
     const r = await fetch(API+"/reset",{method:"POST",headers:headers()});
     if(r.status===401){ openCfg("Wrong or missing token."); return; }
+    if(!r.ok){   // e.g. 429: the server still has the old conversation, so keep showing it
+      add(r.status===429 ? "Too many requests — try again in a moment." : "Couldn't start a new conversation.","sys");
+      return;
+    }
+    historyGen++;
     log.replaceChildren(); add("New conversation","sys");
   }catch(e){ add("Couldn't reach the brain.","sys"); }
 };

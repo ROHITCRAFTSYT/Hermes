@@ -75,6 +75,10 @@ class Settings(BaseSettings):
     local_llm_model: str = ""
     local_llm_api_key: str = ""
     local_llm_timeout_s: float = Field(90.0, gt=0, le=600)
+    # LLM_PROVIDER=local only sets priority: if the local server is down, the conversation goes to
+    # the next provider that has a key (Groq, NVIDIA...). LLM_LOCAL_ONLY=1 drops those fallbacks, so
+    # replies are never generated off this PC. (Speech-to-text still uses Groq or Gnani.)
+    llm_local_only: bool = False
 
     # Edge neural voices
     tts_voice: str = "en-US-AvaMultilingualNeural"
@@ -124,6 +128,8 @@ class Settings(BaseSettings):
         return [p for p in order if have[p]]
 
     def llm_chain(self) -> list[str]:
+        if self.llm_local_only:
+            return ["local"] if self.local_llm_model else []
         have = {"groq": bool(self.groq_api_key), "nvidia": bool(self.nvidia_api_key),
                 "evon": bool(self.evon_base_url), "local": bool(self.local_llm_model)}
         order = [self.llm_provider] + [p for p in ("groq", "nvidia", "evon", "local") if p != self.llm_provider]
@@ -147,6 +153,8 @@ class Settings(BaseSettings):
             out.append("LLM_PROVIDER=evon but EVON_BASE_URL is empty; using Groq/NVIDIA")
         if self.llm_provider == "local" and not self.local_llm_model:
             out.append("LLM_PROVIDER=local but LOCAL_LLM_MODEL is empty; using Groq/NVIDIA")
+        if self.llm_local_only and not self.local_llm_model:
+            out.append("LLM_LOCAL_ONLY=1 but LOCAL_LLM_MODEL is empty; no LLM will answer")
         if not self.stt_chain():
             out.append("no speech-to-text key set (GROQ_API_KEY or GNANI_API_KEY); voice input won't work")
         if not self.llm_chain():

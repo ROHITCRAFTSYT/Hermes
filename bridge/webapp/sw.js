@@ -2,7 +2,7 @@
 // We intentionally do NOT cache API calls (they must always hit the live brain).
 // The app shell is network-first: always the latest version when the brain is reachable,
 // the cached copy only when offline (cache-first would pin phones to an old app forever).
-const CACHE = "hermes-shell-v3";
+const CACHE = "hermes-shell-v4";
 const SHELL = ["./", "./index.html", "./icon.svg", "./manifest.webmanifest"];
 self.addEventListener("install", e => {
   e.waitUntil(caches.open(CACHE).then(c => c.addAll(SHELL)).catch(() => {}));

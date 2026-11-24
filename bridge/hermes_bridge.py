@@ -379,6 +379,12 @@ def _run_agent_locked(user_text: str) -> str:
                 if not force or force == "none" or is_rate_limit(e):
                     raise
                 msg = P.llm.chat(messages)   # provider refused a forced tool call; let the model choose
+            if force and force != "none" and not msg["tool_calls"]:
+                # Some servers (Ollama) ignore tool_choice, so the model may answer a weather or news
+                # question from stale memory. Ask once more, explicitly, before accepting that.
+                msg = P.llm.chat(messages + [{"role": "system", "content":
+                                 f"Call the {force} tool now to get live data. Do not answer from memory."}],
+                                 force)
             if force == "none" and msg["tool_calls"]:
                 # Some models (NVIDIA nemotron) emit tool calls even when none are offered — never run them.
                 msg["tool_calls"] = []
@@ -710,9 +716,15 @@ async def history():
 
 @app.post("/reset", dependencies=[Depends(guard)])
 async def reset():
+    # The agent lock can be held for seconds by a running /chat; wait for it on a worker thread,
+    # never on the event loop, or /health and every other request would stall meanwhile.
+    await asyncio.to_thread(_reset_conversation)
+    return JSONResponse({"ok": True})
+
+
+def _reset_conversation() -> None:
     with _AGENT_LOCK:
         _clear_convo()
-    return JSONResponse({"ok": True})
 
 
 @app.get("/timers", dependencies=[Depends(guard)])

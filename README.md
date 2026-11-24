@@ -85,8 +85,8 @@ The diagram shows the Gnani-first setup used for the demo. The default is Groq f
 - 🔒 **Token‑secured**, LAN‑first, with optional **remote access** from anywhere.
 - 🇮🇳 **Gnani voice models** — Prisma speech-to-text, Timbre text-to-speech and the
   Evon LLM as pluggable providers, chosen in `.env`.
-- 🏠 **Local LLM option** — run the brain on Ollama / LM Studio for unlimited, private
-  replies, as the main model or the last fallback.
+- 🏠 **Local LLM option** — run the brain on Ollama / LM Studio for unlimited replies, as the
+  main model or the last fallback; `LLM_LOCAL_ONLY=1` keeps every reply on your PC.
 - 🔁 **Resilient** — auto‑discovers the brain by name (mDNS). Every provider call has a
   timeout and bounded retries, and each stage falls back to the next provider.
 
@@ -253,17 +253,22 @@ The brain serves a control app — no ESP needed. On any device on your Wi‑Fi 
 talk. "Add to Home Screen" installs it like a native app. To use it from outside
 your home, see [`REMOTE_ACCESS.md`](REMOTE_ACCESS.md).
 
-### 4 — A local model (optional, no limits, private)
+### 4 — A local model (optional, no limits)
 
 Hermes can think with a model running on your own PC — no daily caps, and your
-requests never leave the house (speech‑to‑text still uses Groq or Gnani).
+replies can be generated without leaving the house (speech‑to‑text still uses Groq or Gnani).
 
 1. Install [Ollama](https://ollama.com) and pull a model that supports **tool calling**:
    `ollama pull qwen3:8b` (or `llama3.1:8b`, `gpt-oss:20b`, `mistral-nemo`).
 2. In `bridge/.env` set `LOCAL_LLM_MODEL=qwen3:8b`. LM Studio and other
    OpenAI‑compatible servers work too: point `LOCAL_LLM_BASE_URL` at them
    (LM Studio: `http://localhost:1234/v1`; from Docker: `http://host.docker.internal:11434/v1`).
-3. By default it's the last fallback. `LLM_PROVIDER=local` makes it the main brain.
+3. By default it's the last fallback. `LLM_PROVIDER=local` makes it the main brain — but that
+   only sets the **order**: if the local server is down, the conversation goes to the next provider
+   with a key (Groq, NVIDIA…), i.e. to the cloud.
+4. To keep replies on your PC no matter what, also set `LLM_LOCAL_ONLY=1`. Then there is no cloud
+   fallback for the brain: if the local server is down, Hermes says it can't answer. (Your voice is
+   still transcribed by Groq or Gnani; type in the app to avoid that too.)
 
 The startup banner shows the order, e.g. `Brain (LLM) : groq -> nvidia -> local`.
 

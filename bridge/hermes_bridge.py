@@ -7,9 +7,11 @@ Endpoints:
     POST /voice           ESP32 posts WAV, gets WAV back
     POST /chat            app posts {"text": "..."}, gets {"reply": "..."}
     POST /talk            app posts recorded audio, gets {heard, reply, audio_b64}
+    GET  /history         recent conversation          POST /reset          start a new conversation
+    GET  /timers          pending timers/reminders     DELETE /timers/{id}  cancel one
 
-All POST endpoints require header  X-Hermes-Token  when HERMES_TOKEN is set, and are
-rate limited per client (RATE_LIMIT_PER_MIN).
+Every endpoint except /health and /app requires header  X-Hermes-Token  when HERMES_TOKEN
+is set, and is rate limited per client (RATE_LIMIT_PER_MIN).
 
 Run:  .venv\\Scripts\\python hermes_bridge.py
 """
@@ -125,6 +127,9 @@ _PERSONAL = re.compile(r"\b(my|mine)\b", re.I)
 _MUSIC_QUESTION = re.compile(r"\b(spotify|what'?s playing|what is playing|this song|current song|which song)\b", re.I)
 _PLAY_MUSIC = re.compile(r"^\s*(please\s+|can you\s+|hey\s+\w+,?\s+)?play\b(?!.*\b(youtube|video)s?\b)", re.I)
 _TIMER_TALK = re.compile(r"\b(timers?|remind(ers?)?|alarms?|wake me)\b", re.I)
+_WEATHER = re.compile(r"\b(weather|forecast|umbrella)\b|\b(will|is|does) it (going to |gonna )?(rain|snow)"
+                      r"|\bhow (hot|cold|humid) is it\b|வானிலை", re.I)
+_OPEN = re.compile(r"^\s*(open|launch|go to|start)\b", re.I)
 
 
 def _first_tool(text: str) -> str | None:
@@ -133,6 +138,8 @@ def _first_tool(text: str) -> str | None:
         return "timer"
     if _PLAY_MUSIC.search(text):
         return "spotify"
+    if _WEATHER.search(text) and not _OPEN.match(text):   # "open the weather app" is an app
+        return "weather"
     if _COMMAND.match(text) or _NO_SEARCH.search(text):
         return None   # open/close/pause Spotify etc.: the model picks the right tool
     if _MUSIC_QUESTION.search(text):
@@ -313,6 +320,12 @@ def _model_error_reply(exc: Exception) -> str:
             mins = max(1, round(delay / 60))
             return f"My model limit is full right now. Please try again in about {mins} minutes."
         return "My model limit is busy for a moment. Please try again in a few seconds."
+    # Problems the user can fix in .env: say which, instead of a vague "try again".
+    text = str(exc).lower()
+    if re.search(r"\b401\b|invalid.api.key|unauthori[sz]ed", text):
+        return "My A P I key was rejected. Please check the keys in the dot env file."
+    if re.search(r"\b410\b|end of life|no longer available|model_not_found|model .* does not exist", text):
+        return "My A I model has been retired. Please set a newer model name in the dot env file."
     return "My brain hit an error while thinking. Please try again."
 
 
@@ -331,17 +344,22 @@ def _remember(user_text: str, reply: str):
     _save_convo()
 
 
-def _run_agent_locked(user_text: str) -> str:
+def _clear_convo():
     global CONVO
+    CONVO = []
+    _save_convo()
+
+
+def _run_agent_locked(user_text: str) -> str:
     if not P.llm:
-        return "My brain isn't connected yet. Please add a Groq, NVIDIA or Evon setting to the dot env file."
+        return ("My brain isn't connected yet. Please add a Groq, NVIDIA or Evon setting, "
+                "or a local model, to the dot env file.")
     if not any(c.isalnum() for c in user_text or ""):   # empty, or Whisper heard only "." on silence
         return "Sorry, I didn't catch that."
 
     low = user_text.lower().strip()
     if any(p in low for p in _RESET_PHRASES):
-        CONVO = []
-        _save_convo()
+        _clear_convo()
         return "Okay, I've cleared our conversation. Starting fresh."
 
     # System prompt + recent history + the new turn → this gives it context.
@@ -674,9 +692,39 @@ async def chat(request: Request):
         raise HTTPException(status_code=413, detail="Text too long")
     reply = await asyncio.to_thread(run_agent, text)
     log.info("turn", extra={"text": text, "reply": reply})
+    if body.get("audio") is True:   # the app speaks the reply itself (a phone in another room)
+        mp3, wav = await asyncio.to_thread(render_speech, reply)
+        threading.Thread(target=play_on_pc, args=(mp3, wav), daemon=True).start()
+        return JSONResponse({"reply": reply, "audio_b64": base64.b64encode(wav).decode()})
     # Speak it on the PC in the background: the app shows the text without waiting for the voice.
     threading.Thread(target=speak_on_pc, args=(reply,), daemon=True).start()
     return JSONResponse({"reply": reply})
+
+
+@app.get("/history", dependencies=[Depends(guard)])
+async def history():
+    """The recent conversation, so the app shows it on open (and on every device)."""
+    return JSONResponse({"messages": [{"role": m.get("role"), "content": m.get("content", "")}
+                                      for m in CONVO if m.get("role") in ("user", "assistant")]})
+
+
+@app.post("/reset", dependencies=[Depends(guard)])
+async def reset():
+    with _AGENT_LOCK:
+        _clear_convo()
+    return JSONResponse({"ok": True})
+
+
+@app.get("/timers", dependencies=[Depends(guard)])
+async def timers_list():
+    return JSONResponse({"timers": TM.active(), "now": time.time()})
+
+
+@app.delete("/timers/{item_id}", dependencies=[Depends(guard)])
+async def timers_cancel(item_id: str):
+    if not TM.cancel_id(item_id):
+        raise HTTPException(status_code=404, detail="No such timer")
+    return JSONResponse({"ok": True})
 
 
 @app.post("/talk", dependencies=[Depends(guard)])
@@ -722,7 +770,8 @@ async def spotify_callback(request: Request, code: str = "", state: str = "", er
 
 
 def _llm_label() -> str:
-    models = {"groq": S.llm_model, "nvidia": S.nvidia_llm_model, "evon": S.evon_model}
+    models = {"groq": S.llm_model, "nvidia": S.nvidia_llm_model, "evon": S.evon_model,
+              "local": f"{S.local_llm_model} (local)"}
     return models[P.llm.names[0]] if P.llm.names else "none"
 
 

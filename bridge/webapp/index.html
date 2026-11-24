@@ -26,6 +26,15 @@
   .brand small{display:block;font-weight:400;font-size:.72rem;color:var(--muted);letter-spacing:.02em}
   .iconbtn{background:var(--surface-2);border:1px solid var(--line);color:var(--muted);
     width:38px;height:38px;border-radius:10px;font-size:1.1rem;cursor:pointer}
+  .iconbtn[aria-pressed="true"]{color:var(--accent);border-color:var(--accent)}
+  .tools{display:flex;gap:8px}
+  #timers{display:flex;gap:8px;overflow-x:auto;padding:8px 18px;border-bottom:1px solid var(--line)}
+  #timers:empty{display:none}
+  .timer{flex:0 0 auto;display:flex;align-items:center;gap:8px;background:var(--surface-2);
+    border:1px solid var(--line);border-left:3px solid var(--teal);border-radius:10px;
+    padding:6px 6px 6px 10px;font-size:.8rem}
+  .timer b{font-variant-numeric:tabular-nums;color:var(--teal)}
+  .timer button{background:none;border:none;color:var(--muted);cursor:pointer;font-size:.9rem;padding:2px 6px}
   #status{font-size:.72rem;color:var(--muted);padding:6px 18px;border-bottom:1px solid var(--line)}
   #status b{color:var(--good)}
   #status.bad b{color:var(--bad)}
@@ -70,9 +79,14 @@
 <body>
   <header>
     <div class="brand"><span class="dot"></span><div>Hermes<small>home agent</small></div></div>
-    <button class="iconbtn" id="gear" title="Settings">⚙</button>
+    <div class="tools">
+      <button class="iconbtn" id="speak" title="Also speak replies on this device" aria-pressed="false">🔈</button>
+      <button class="iconbtn" id="newchat" title="New conversation">＋</button>
+      <button class="iconbtn" id="gear" title="Settings">⚙</button>
+    </div>
   </header>
   <div id="status">connecting…</div>
+  <div id="timers" aria-label="Active timers and reminders"></div>
 
   <main id="log">
     <div class="hint">Tap the mic and speak, or type a command below.<br>Try “what can you do?”</div>
@@ -85,6 +99,7 @@
     <button class="chip">Play music</button>
     <button class="chip">Pause</button>
     <button class="chip">What's the weather?</button>
+    <button class="chip">Set a 5 minute timer</button>
     <button class="chip">Lock the PC</button>
   </div>
 
@@ -123,8 +138,13 @@ async function health(){
   try{
     const r = await fetch(API + "/health");
     const j = await r.json();
-    if(!j.brain){ statusEl.className="bad"; statusEl.innerHTML="online, but <b>no LLM key</b> — add one to .env"; }
-    else{ statusEl.className=""; statusEl.innerHTML="<b>ready</b> · "+j.llm+(j.auth?" · 🔒":""); }
+    if(!j.brain){ statusEl.className="bad"; statusEl.innerHTML="online, but <b>no AI model</b> — add a key to .env"; }
+    else{
+      // "ready · llama-3.3-70b → nvidia → local · 🔒": the main model, then the fallbacks
+      statusEl.className=""; statusEl.innerHTML="<b>ready</b>";
+      const chain = [j.llm, ...((j.providers && j.providers.llm) || []).slice(1)].join(" → ");
+      statusEl.append(" · " + chain + (j.auth?" · 🔒":""));
+    }
   }catch(e){ statusEl.className="bad"; statusEl.innerHTML="<b>can't reach brain</b> — is the bridge running?"; }
 }
 
@@ -134,10 +154,12 @@ async function sendText(text){
   const t = add("…","bot");
   try{
     const r = await fetch(API+"/chat",{method:"POST",headers:headers({"Content-Type":"application/json"}),
-      body:JSON.stringify({text})});
+      body:JSON.stringify({text, audio:speakHere})});
     if(r.status===401){ t.remove(); openCfg("Wrong or missing token."); return; }
     const j = await readJson(r);
     t.textContent = j.reply || j.detail || "No reply.";
+    if(j.audio_b64) playB64(j.audio_b64);
+    refreshTimers();
   }catch(e){ t.textContent = "Couldn't reach the brain: " + e.message; }
 }
 async function readJson(r){
@@ -175,7 +197,8 @@ mic.onclick = async ()=>{
         const j = await readJson(r);
         me.textContent = j.heard || "🎤 (couldn't hear)";
         bot.textContent = j.reply;
-        if(j.audio_b64) playB64(j.audio_b64);
+        if(j.audio_b64 && speakHere) playB64(j.audio_b64);
+        refreshTimers();
       }catch(e){ bot.textContent="Voice failed: " + e.message; }
     };
     mediaRec.start(); recording=true; mic.classList.add("rec"); mic.textContent="■";
@@ -188,6 +211,72 @@ function playB64(b64){
   new Audio(url).play().catch(()=>{});
 }
 
+// ── speak on this device (off by default: the PC already speaks) ──
+let speakHere = localStorage.getItem("hermes_speak")==="1";
+const speakBtn = document.getElementById("speak");
+function showSpeak(){ speakBtn.setAttribute("aria-pressed", String(speakHere)); speakBtn.textContent = speakHere?"🔊":"🔈"; }
+speakBtn.onclick = ()=>{ speakHere=!speakHere; localStorage.setItem("hermes_speak", speakHere?"1":"0"); showSpeak(); };
+showSpeak();
+
+// ── conversation history & new chat ──
+async function loadHistory(){
+  try{
+    const r = await fetch(API+"/history",{headers:headers()});
+    if(!r.ok) return;
+    const j = await r.json();
+    if(!(j.messages||[]).length) return;
+    log.replaceChildren();
+    j.messages.forEach(m=>add(m.content, m.role==="user"?"me":"bot"));
+  }catch(e){}
+}
+document.getElementById("newchat").onclick = async ()=>{
+  try{
+    const r = await fetch(API+"/reset",{method:"POST",headers:headers()});
+    if(r.status===401){ openCfg("Wrong or missing token."); return; }
+    log.replaceChildren(); add("New conversation","sys");
+  }catch(e){ add("Couldn't reach the brain.","sys"); }
+};
+
+// ── timers & reminders strip (live countdown, ✕ to cancel) ──
+const timersEl = document.getElementById("timers");
+let timers = [], clockSkew = 0;
+function left(due){
+  const s = Math.max(0, Math.round(due - (Date.now()/1000 + clockSkew)));
+  const h = Math.floor(s/3600), m = Math.floor(s%3600/60), sec = s%60;
+  return h ? `${h}:${String(m).padStart(2,"0")}:${String(sec).padStart(2,"0")}` : `${m}:${String(sec).padStart(2,"0")}`;
+}
+function drawTimers(){
+  timersEl.replaceChildren(...timers.map(t=>{
+    const d = document.createElement("div"); d.className="timer";
+    const name = document.createElement("span");
+    const when = document.createElement("b");
+    if(t.kind==="timer"){ name.textContent = (t.label||"Timer"); when.dataset.due = t.due; when.textContent = left(t.due); }
+    else{
+      name.textContent = (t.kind==="alarm"?"⏰ ":"🔔 ") + (t.label || t.kind);
+      when.textContent = new Date((t.due - clockSkew)*1000).toLocaleTimeString([], {hour:"numeric", minute:"2-digit"});
+    }
+    const x = document.createElement("button"); x.textContent="✕"; x.title="Cancel";
+    x.onclick = async ()=>{ await fetch(API+"/timers/"+encodeURIComponent(t.id),{method:"DELETE",headers:headers()}); refreshTimers(); };
+    d.append(name, when, x); return d;
+  }));
+}
+async function refreshTimers(){
+  try{
+    const r = await fetch(API+"/timers",{headers:headers()});
+    if(!r.ok) return;
+    const j = await r.json();
+    clockSkew = j.now - Date.now()/1000;   // the PC's clock is the source of truth
+    timers = j.timers || []; drawTimers();
+  }catch(e){}
+}
+// Tick the countdowns in place (rebuilding the strip every second would swallow clicks on ✕).
+setInterval(()=>{
+  timersEl.querySelectorAll("b[data-due]").forEach(b=>{ b.textContent = left(+b.dataset.due); });
+  const live = timers.filter(t=>t.due > Date.now()/1000 + clockSkew);
+  if(live.length !== timers.length){ timers = live; drawTimers(); }
+}, 1000);
+setInterval(refreshTimers, 15000);
+
 // ── wiring ──
 document.getElementById("send").onclick = ()=>{ const t=document.getElementById("text"); sendText(t.value.trim()); t.value=""; };
 document.getElementById("text").addEventListener("keydown",e=>{ if(e.key==="Enter"){ document.getElementById("send").click(); }});
@@ -195,9 +284,9 @@ document.getElementById("chips").addEventListener("click",e=>{ if(e.target.class
 document.getElementById("gear").onclick = ()=>openCfg();
 function openCfg(msg){ if(msg) cfg.querySelector("p").textContent=msg; document.getElementById("tok").value=TOKEN; cfg.showModal(); }
 document.getElementById("save").onclick = ()=>{ TOKEN=document.getElementById("tok").value.trim();
-  localStorage.setItem("hermes_token",TOKEN); cfg.close(); health(); };
+  localStorage.setItem("hermes_token",TOKEN); cfg.close(); health(); loadHistory(); refreshTimers(); };
 
-health();
+health(); loadHistory(); refreshTimers();
 if(!TOKEN) setTimeout(()=>{ fetch(API+"/health").then(r=>r.json()).then(j=>{ if(j.auth) openCfg(); }); }, 300);
 if("serviceWorker" in navigator) navigator.serviceWorker.register("sw.js").catch(()=>{});
 </script>

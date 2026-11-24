@@ -69,6 +69,8 @@ The diagram shows the Gnani-first setup used for the demo. The default is Groq f
   PC; they survive restarts.
 - 📈 **Always current** — knows today's date, searches the web before answering
   anything that changes, and pulls live crypto prices from CoinGecko.
+- 🌦️ **Live weather** — "what's the weather?", "will it rain tomorrow in Paris?" —
+  current conditions and forecast from Open‑Meteo (free, no key).
 - 🏠 **Smart‑home control** — Tuya bulbs/plugs, custom ESP relay nodes (MQTT),
   Wake‑on‑LAN, HTTP devices, and **Home Assistant** (1000s of devices).
 - 📺 **TV / Cast control** — Chromecast / Google Cast / Android TV, no app on the TV.
@@ -77,10 +79,14 @@ The diagram shows the Gnani-first setup used for the demo. The default is Groq f
   distance?") and long‑term facts ("remember my router is in the study").
 - 🗣️ **Natural, bilingual voice** — auto English **and Tamil**, spoken with
   human‑sounding neural voices (free, no API key).
-- 📱 **Phone/web app** — a PWA served by the brain; type or talk from any device.
+- 📱 **Phone/web app** — a PWA served by the brain; type or talk from any device. Shows
+  your recent conversation, live timer countdowns (tap ✕ to cancel), a one‑tap
+  *new conversation*, and can speak replies on the phone itself (🔈).
 - 🔒 **Token‑secured**, LAN‑first, with optional **remote access** from anywhere.
 - 🇮🇳 **Gnani voice models** — Prisma speech-to-text, Timbre text-to-speech and the
   Evon LLM as pluggable providers, chosen in `.env`.
+- 🏠 **Local LLM option** — run the brain on Ollama / LM Studio for unlimited, private
+  replies, as the main model or the last fallback.
 - 🔁 **Resilient** — auto‑discovers the brain by name (mDNS). Every provider call has a
   timeout and bounded retries, and each stage falls back to the next provider.
 
@@ -247,7 +253,21 @@ The brain serves a control app — no ESP needed. On any device on your Wi‑Fi 
 talk. "Add to Home Screen" installs it like a native app. To use it from outside
 your home, see [`REMOTE_ACCESS.md`](REMOTE_ACCESS.md).
 
-### 4 — Controlling another computer (optional)
+### 4 — A local model (optional, no limits, private)
+
+Hermes can think with a model running on your own PC — no daily caps, and your
+requests never leave the house (speech‑to‑text still uses Groq or Gnani).
+
+1. Install [Ollama](https://ollama.com) and pull a model that supports **tool calling**:
+   `ollama pull qwen3:8b` (or `llama3.1:8b`, `gpt-oss:20b`, `mistral-nemo`).
+2. In `bridge/.env` set `LOCAL_LLM_MODEL=qwen3:8b`. LM Studio and other
+   OpenAI‑compatible servers work too: point `LOCAL_LLM_BASE_URL` at them
+   (LM Studio: `http://localhost:1234/v1`; from Docker: `http://host.docker.internal:11434/v1`).
+3. By default it's the last fallback. `LLM_PROVIDER=local` makes it the main brain.
+
+The startup banner shows the order, e.g. `Brain (LLM) : groq -> nvidia -> local`.
+
+### 5 — Controlling another computer (optional)
 
 On the *other* PC, run **`agent/install_agent.bat`** once (needs Python). It asks
 for your brain's `HERMES_TOKEN` (the agent refuses every command without it),
@@ -255,7 +275,7 @@ installs a tiny agent that auto‑starts at login, and prints that PC's IP. Add 
 to `bridge/devices.json` under `computers` (with the same token), then say
 *"open notepad on the other laptop"*.
 
-### 5 — Spotify playback (optional, needs Premium)
+### 6 — Spotify playback (optional, needs Premium)
 
 Spotify only allows playing a chosen song through its Web API, which needs a
 **Premium** account and a free developer app (one time, ~5 minutes):
@@ -337,6 +357,7 @@ See [`DEMO_SCRIPT.md`](DEMO_SCRIPT.md) for the video shot list.
 | PC & media | "pause" · "volume up" · "take a screenshot" · "lock the PC" |
 | Spotify | "play Over My Dead Body" · "play artist Anirudh" · "play playlist Today's Top Hits" · "next song" · "what's playing?" |
 | Live prices | "what's the price of Bitcoin?" · "how much is Solana?" |
+| Weather | "what's the weather?" · "will it rain tomorrow?" · "weather in Paris" |
 | Timers & reminders | "set a timer for 10 minutes" · "remind me in 20 minutes to check the oven" · "remind me at 6 pm to call mom" · "wake me up at 7 every day" · "how long is left on my timer?" · "cancel the pasta timer" |
 | Windows | "close Chrome" · "switch to Word" |
 | Network | "scan the network" · "wake my desktop" · "is the printer online?" |
@@ -361,7 +382,10 @@ See [`DEMO_SCRIPT.md`](DEMO_SCRIPT.md) for the video shot list.
 - **`bridge/.env`** — provider choice (`STT_PROVIDER`, `LLM_PROVIDER`, `TTS_PROVIDER`),
   Gnani/Groq/NVIDIA/Evon keys and models, `HERMES_TOKEN`, `RATE_LIMIT_PER_MIN`,
   `HTTP_TIMEOUT_S` / `HTTP_RETRIES`, `LOG_FORMAT`, `PLAY_ON_PC`, `SPOTIFY_CLIENT_ID`,
-  `LLM_MAX_TOKENS` / `REASONING_EFFORT`. `TTS_ENGINE` still works as an alias for `TTS_PROVIDER`.
+  `LLM_MAX_TOKENS` / `REASONING_EFFORT`, `LOCAL_LLM_MODEL` / `LOCAL_LLM_BASE_URL` /
+  `LOCAL_LLM_TIMEOUT_S`, `WEATHER_LOCATION`. `TTS_ENGINE` still works as an alias for `TTS_PROVIDER`.
+- **Weather location** — `WEATHER_LOCATION` in `.env`, or just say *"remember my city
+  is Chennai"*. Add a region to disambiguate: `Springfield, Illinois`.
 - **`firmware/…/config.h`** — `BRIDGE_HOST`/`BRIDGE_TOKEN`, `MAX_RECORD_SECONDS`,
   `MIC_GAIN_SHIFT` (lower = louder), `USE_MDNS`.
 - **`bridge/devices.json`** — named devices for control‑by‑voice:
@@ -385,7 +409,10 @@ See [`DEMO_SCRIPT.md`](DEMO_SCRIPT.md) for the video shot list.
 | Spoken *"limit is full"* | Groq's **per‑model** daily token cap. Switch `LLM_MODEL` (e.g. `openai/gpt-oss-20b` → `qwen/qwen3.8-27b`) or set `NVIDIA_API_KEY` for auto‑fallback. |
 | Won't join Wi‑Fi (`reason=2/202`) | The network is **WPA3** or 5 GHz. A classic ESP32 needs **WPA2 + 2.4 GHz**. |
 | Won't join, "too many devices" (`reason=5`) | The hotspot's **device limit** is full — raise it / free a slot. |
-| `"brain": false` on `/health` | No LLM configured: set `GROQ_API_KEY`, `NVIDIA_API_KEY` or `EVON_BASE_URL`. |
+| `"brain": false` on `/health` | No LLM configured: set `GROQ_API_KEY`, `NVIDIA_API_KEY`, `EVON_BASE_URL` or `LOCAL_LLM_MODEL`. |
+| Spoken *"my API key was rejected"* | A key in `.env` is wrong, revoked or expired — make a new one (Groq: https://console.groq.com/keys). The log names the provider. |
+| Spoken *"my AI model has been retired"* | The provider removed that model — set a current `LLM_MODEL` / `NVIDIA_LLM_MODEL`. NVIDIA's list: `https://integrate.api.nvidia.com/v1/models`. |
+| Local model ignores commands | Use a model with tool calling (qwen3, llama3.1+, gpt-oss); small models (<7B) often skip tools. |
 | Bridge exits with *Invalid Hermes configuration* | The message names the bad variable in `.env`; fix that value. |
 | `429 Too many requests` | Over `RATE_LIMIT_PER_MIN` for that device. Raise it, or `0` turns the limit off. |
 | Gnani set but `/health` shows `groq` | `GNANI_API_KEY` is empty, so the chain skipped Gnani. The startup log says so. |
@@ -422,7 +449,8 @@ ruff check .
 pytest
 ```
 
-Tests mock every provider (Gnani, Groq, NVIDIA, Evon) at the HTTP layer and run on Linux.
+Tests mock every provider (Gnani, Groq, NVIDIA, Evon, local) and Open‑Meteo at the HTTP layer,
+never touch your real memory/timers/conversation, and run on Linux.
 CI runs ruff, pytest on Python 3.11 and 3.12, and a Docker build plus `/health` check.
 
 ---
@@ -432,7 +460,8 @@ CI runs ruff, pytest on Python 3.11 and 3.12, and a Docker build plus `/health` 
 - Hands‑free **wake word** ("Hey Hermes") on an ESP32‑**S3** (needs PSRAM).
 - **WebSocket streaming** + barge‑in for faster, interruptible replies.
 - Wi‑Fi onboarding via a **captive portal** (change networks without reflashing).
-- A **local LLM** option (Ollama) for fully offline, no‑limit operation.
+- ~~A **local LLM** option (Ollama)~~ ✅ done — next: local speech‑to‑text (faster‑whisper)
+  for fully offline voice.
 
 ---
 

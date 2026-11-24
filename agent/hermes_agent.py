@@ -17,6 +17,7 @@ HERMES_TOKEN environment variable. Keep it on your own trusted network.
 """
 
 import ctypes
+import hmac
 import json
 import os
 import re
@@ -235,7 +236,7 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         if not TOKEN:
             self._send(401, {"error": "no token set on this PC — re-run install_agent.bat"}); return
-        if self.headers.get("X-Hermes-Token") != TOKEN:
+        if not hmac.compare_digest((self.headers.get("X-Hermes-Token") or "").encode(), TOKEN.encode()):
             self._send(401, {"error": "bad token"}); return
         if not self.path.startswith("/do"):
             self._send(404, {"error": "not found"}); return

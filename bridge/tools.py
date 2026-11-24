@@ -356,6 +356,96 @@ def crypto_price(coin: str) -> str:
         return web_search(f"{coin} crypto price today")
 
 
+# ── Weather (Open-Meteo: free, no key) ───────────────────────────────────────
+
+_WMO = {0: "clear sky", 1: "mainly clear", 2: "partly cloudy", 3: "overcast", 45: "fog", 48: "freezing fog",
+        51: "light drizzle", 53: "drizzle", 55: "heavy drizzle", 56: "freezing drizzle", 57: "freezing drizzle",
+        61: "light rain", 63: "rain", 65: "heavy rain", 66: "freezing rain", 67: "freezing rain",
+        71: "light snow", 73: "snow", 75: "heavy snow", 77: "snow grains", 80: "light showers",
+        81: "showers", 82: "violent showers", 85: "snow showers", 86: "heavy snow showers",
+        95: "thunderstorms", 96: "thunderstorms with hail", 99: "thunderstorms with heavy hail"}
+_GEO_CACHE: dict[str, dict] = {}
+_HOME_KEYS = ("home city", "my city", "city", "home town", "hometown", "location", "where i live", "home")
+
+
+def _default_location() -> str:
+    """WEATHER_LOCATION from .env, else a city the user asked Hermes to remember."""
+    if loc := os.environ.get("WEATHER_LOCATION", "").strip():
+        return loc
+    mem = {re.sub(r"[_\-]+", " ", k.lower()).strip(): v for k, v in _mem().items()}
+    for k in _HOME_KEYS:
+        if mem.get(k):
+            return str(mem[k])
+    return ""
+
+
+def _geocode(http, place: str) -> dict | None:
+    key = place.lower().strip()
+    if key in _GEO_CACHE:
+        return _GEO_CACHE[key]
+    # The geocoder matches a bare name; "Chennai, India" is split and the rest used to pick a hit.
+    name, *rest = [p.strip() for p in place.split(",") if p.strip()] or [place]
+    r = http.get("https://geocoding-api.open-meteo.com/v1/search",
+                 params={"name": name, "count": 10, "language": "en", "format": "json"})
+    r.raise_for_status()
+    hits = r.json().get("results") or []
+    if rest:
+        want = " ".join(rest).lower()
+        hits = sorted(hits, key=lambda h: not any(want in (h.get(f) or "").lower()
+                                                  for f in ("country", "admin1", "country_code")))
+    if not hits:
+        return None
+    _GEO_CACHE[key] = hits[0]
+    return hits[0]
+
+
+def weather(location: str = "", day: str = "now") -> str:
+    """Live weather and a short forecast for a place (or the user's home location)."""
+    place = (location or "").strip()
+    if place.lower() in ("", "here", "home", "my city", "my location", "outside", "local"):
+        place = _default_location()
+    if not place:
+        return ("I don't know which city to check. Tell me the city, or set WEATHER_LOCATION in .env "
+                "(or say 'remember my city is Chennai').")
+    try:
+        import httpx
+        with httpx.Client(timeout=6, transport=httpx.HTTPTransport(retries=2)) as http:
+            geo = _geocode(http, place)
+            if not geo:
+                return f"I couldn't find a place called '{place}'."
+            r = http.get("https://api.open-meteo.com/v1/forecast", params={
+                "latitude": geo["latitude"], "longitude": geo["longitude"], "timezone": "auto",
+                "current": "temperature_2m,apparent_temperature,relative_humidity_2m,weather_code,wind_speed_10m",
+                "daily": "weather_code,temperature_2m_max,temperature_2m_min,precipitation_probability_max",
+                "forecast_days": 3})
+            r.raise_for_status()
+            data = r.json()
+    except Exception:
+        return web_search(f"weather in {place} {day}")   # Open-Meteo down or unreachable
+    where = ", ".join(x for x in (geo.get("name"), geo.get("admin1") or geo.get("country")) if x)
+    cur, daily = data.get("current", {}), data.get("daily", {})
+
+    def day_text(i: int, label: str) -> str:
+        try:
+            hi, lo = daily["temperature_2m_max"][i], daily["temperature_2m_min"][i]
+            sky = _WMO.get(daily["weather_code"][i], "mixed weather")
+            rain = (daily.get("precipitation_probability_max") or [None] * 3)[i]
+            return (f"{label}: {sky}, high {round(hi)}°C, low {round(lo)}°C"
+                    + (f", {rain}% chance of rain" if rain is not None else "") + ".")
+        except (KeyError, IndexError, TypeError):
+            return ""
+
+    d = (day or "now").lower()
+    if "tomorrow" in d:
+        return f"Weather for {where} — " + (day_text(1, "tomorrow") or "no forecast available.")
+    now = ""
+    if cur:
+        now = (f"Right now in {where}: {_WMO.get(cur.get('weather_code'), 'mixed weather')}, "
+               f"{round(cur.get('temperature_2m', 0))}°C (feels like {round(cur.get('apparent_temperature', 0))}°C), "
+               f"humidity {cur.get('relative_humidity_2m')}%, wind {round(cur.get('wind_speed_10m', 0))} km/h. ")
+    return (now + day_text(0, "Today") + " Live from Open-Meteo.").strip()
+
+
 def timer(action: str, kind: str = "", label: str = "", hours: float = 0, minutes: float = 0,
           seconds: float = 0, at: str = "", repeat: str = "", duration: str = "") -> str:
     import timers as tm
@@ -885,6 +975,12 @@ TOOLS_SPEC = [
         "parameters": {"type": "object", "properties": {
             "coin": {"type": "string", "description": "coin name or ticker, e.g. 'solana', 'BTC', 'trump'"}}, "required": ["coin"]}}},
     {"type": "function", "function": {
+        "name": "weather",
+        "description": "LIVE weather right now plus today's or tomorrow's forecast (temperature, sky, rain chance, humidity, wind). Always use this instead of web_search for weather. Leave 'location' empty for the user's home city.",
+        "parameters": {"type": "object", "properties": {
+            "location": {"type": "string", "description": "city, e.g. 'Chennai' or 'Paris, France'; empty = home"},
+            "day": {"type": "string", "description": "now, today, or tomorrow"}}, "required": []}}},
+    {"type": "function", "function": {
         "name": "timer",
         "description": "Timers, reminders and alarms: 'set a pasta timer for 8 minutes', 'remind me in 20 minutes to check the oven', 'remind me at 6 pm to call mom', 'wake me up at 7 every day', 'how long is left on my timer', 'what reminders do I have', 'cancel the pasta timer'. For a delay put the numbers the user said in hours/minutes/seconds (don't convert units). For a clock time use 'at', e.g. '18:00', '6:30 pm', 'tomorrow 9:00', '2026-10-20 09:00'.",
         "parameters": {"type": "object", "properties": {
@@ -975,6 +1071,7 @@ _DISPATCH = {
     "youtube": youtube,
     "web_search": web_search,
     "crypto_price": crypto_price,
+    "weather": weather,
     "spotify": spotify,
     "timer": timer,
     "read_page": read_page,

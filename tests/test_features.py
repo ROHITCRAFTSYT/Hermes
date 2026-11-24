@@ -231,3 +231,81 @@ def test_reset_phrase_clears_conversation(bridge, monkeypatch):
     bridge.CONVO.extend([{"role": "user", "content": "x"}, {"role": "assistant", "content": "y"}])
     assert "cleared" in bridge.run_agent("new conversation")
     assert bridge.CONVO == []
+
+
+# ── fixes from the CodeRabbit review of #3 ───────────────────────────────────
+
+def test_reset_waits_off_the_event_loop(bridge, client):
+    """While a chat holds the agent lock, /reset must not stall unrelated requests like /health."""
+    import threading
+    import time
+
+    bridge.CONVO.extend([{"role": "user", "content": "x"}, {"role": "assistant", "content": "y"}])
+    result = {}
+    with bridge._AGENT_LOCK:   # a long-running /chat
+        reset = threading.Thread(target=lambda: result.update(reset=client.post("/reset", headers=AUTH)))
+        reset.start()
+        time.sleep(0.2)        # /reset is now waiting for the lock
+        # Ask for /health from another thread, so a blocked event loop fails the test instead of hanging it.
+        health = threading.Thread(target=lambda: result.update(health=client.get("/health")))
+        health.start()
+        health.join(2)
+        answered_while_locked = "health" in result
+        reset_still_waiting = reset.is_alive()
+    reset.join(5)
+    health.join(5)
+    assert answered_while_locked, "/health stalled while /reset waited for the agent lock"
+    assert reset_still_waiting
+    assert result["reset"].json() == {"ok": True} and bridge.CONVO == []
+
+
+def test_weather_matches_each_qualifier(monkeypatch):
+    geo = {"results": [
+        {"name": "London", "admin1": "England", "country": "United Kingdom", "country_code": "GB",
+         "latitude": 51.5, "longitude": -0.1},
+        {"name": "London", "admin1": "Ontario", "country": "Canada", "country_code": "CA",
+         "latitude": 42.98, "longitude": -81.25},
+    ]}
+
+    def handler(request):
+        if "geocoding" in request.url.host:
+            return httpx.Response(200, json=geo)
+        return httpx.Response(200, json=FORECAST)
+    monkeypatch.setattr(httpx, "HTTPTransport", lambda **kw: httpx.MockTransport(handler))
+    assert "London, Ontario" in T.weather("London, Ontario, Canada")
+    assert "London, Ontario" in T.weather("London, Canada")
+    assert "London, England" in T.weather("London, UK")   # no match: keep the geocoder ranking
+
+
+def test_local_only_drops_cloud_fallbacks():
+    keys = {"groq_api_key": "g", "nvidia_api_key": "n", "local_llm_model": "qwen3:8b"}
+    assert make(llm_provider="local", **keys).llm_chain() == ["local", "groq", "nvidia"]   # order only
+    assert make(llm_provider="local", llm_local_only=True, **keys).llm_chain() == ["local"]
+    s = make(llm_local_only=True, groq_api_key="g")
+    assert s.llm_chain() == [] and any("LLM_LOCAL_ONLY=1 but LOCAL_LLM_MODEL is empty" in w for w in s.warnings())
+
+
+class ScriptedLLM:
+    name = "local"
+
+    def __init__(self, replies):
+        self.replies, self.calls = list(replies), []
+
+    def chat(self, messages, extra):
+        self.calls.append((messages, extra))
+        return self.replies.pop(0)
+
+
+def test_forced_tool_skipped_is_asked_again(bridge, monkeypatch):
+    """Ollama ignores tool_choice: a text answer to a weather question gets one explicit retry."""
+    stale = {"provider": "local", "content": "It's sunny, 30°C.", "tool_calls": []}
+    call = {"provider": "local", "content": "", "tool_calls": [
+        {"id": "c1", "name": "weather", "arguments": '{"location": "Chennai"}'}]}
+    final = {"provider": "local", "content": "Drizzle, 27°C.", "tool_calls": []}
+    llm = ScriptedLLM([stale, call, final])
+    monkeypatch.setattr(bridge.P, "llm", LLMChain([llm], tools_spec=T.TOOLS_SPEC))
+    monkeypatch.setattr(T, "dispatch", lambda name, args: "Right now in Chennai: drizzle, 27°C.")
+    assert bridge.run_agent("what's the weather in Chennai?") == "Drizzle, 27°C."
+    retry_messages, retry_extra = llm.calls[1]
+    assert "Call the weather tool now" in retry_messages[-1]["content"]
+    assert retry_extra["tool_choice"]["function"]["name"] == "weather"

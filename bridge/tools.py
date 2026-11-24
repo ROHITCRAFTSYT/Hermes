@@ -390,9 +390,14 @@ def _geocode(http, place: str) -> dict | None:
     r.raise_for_status()
     hits = r.json().get("results") or []
     if rest:
-        want = " ".join(rest).lower()
-        hits = sorted(hits, key=lambda h: not any(want in (h.get(f) or "").lower()
-                                                  for f in ("country", "admin1", "country_code")))
+        # Score each qualifier on its own: "London, Ontario, Canada" must match admin1=Ontario AND
+        # country=Canada, which a joined "ontario canada" string matches in neither field.
+        quals = [q.lower() for q in rest]
+
+        def score(h: dict) -> int:
+            fields = [(h.get(f) or "").lower() for f in ("admin1", "admin2", "country", "country_code")]
+            return sum(any(q == f or (len(q) > 2 and q in f) for f in fields if f) for q in quals)
+        hits = sorted(hits, key=score, reverse=True)   # stable: ties keep the geocoder's ranking
     if not hits:
         return None
     _GEO_CACHE[key] = hits[0]

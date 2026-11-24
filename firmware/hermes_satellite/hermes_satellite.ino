@@ -1,14 +1,18 @@
 /*
  * Hermes Voice Satellite — CLASSIC ESP32 (ESP-WROOM-32) build
  * ----------------------------------------------------------------------------
- * Push-to-talk: hold the button, speak, release. Records ~3 s of 16 kHz mono
- * audio from an INMP441 I2S mic, POSTs it to the Hermes bridge on your PC, and
- * STREAMS the spoken reply straight to a MAX98357A I2S amp + speaker.
+ * Push-to-talk: press the button and speak. Each press records a fixed window
+ * (RECORD_SECONDS, default 3 s) of 16 kHz mono audio from an INMP441 I2S mic,
+ * POSTs it to the Hermes bridge on your PC, and STREAMS the spoken reply
+ * straight to a MAX98357A I2S amp + speaker. Releasing early does not stop it.
  *
- * WiFi is configured on first boot via a captive portal (no password in code):
- *   1. Power on. The board makes a WiFi network called "Hermes-Setup".
- *   2. Connect your phone to it, a page opens, pick your WiFi + enter password.
- *   3. It reboots and connects. (To redo: hold the button while powering on.)
+ * WiFi credentials come from secrets.h (WIFI_SSID / WIFI_PASS), compiled in.
+ * To change networks, edit secrets.h and reflash. Don't hold the BOOT button
+ * (GPIO0) while powering on: that puts the chip into ROM download mode.
+ *
+ * Bridge address: with USE_MDNS 1 the satellite looks for _hermes._tcp on the
+ * LAN and falls back to BRIDGE_HOST. With USE_MDNS 0 it only uses BRIDGE_HOST
+ * (safer: no other LAN device can pose as the bridge and receive the token).
  *
  * NOTE: This chip has no PSRAM, so on-device wake word is not available —
  * push-to-talk only. Pins avoid GPIO6-11 (wired to flash on classic ESP32).
@@ -22,7 +26,11 @@
 #include "config.h"               // bridge/token/behavior settings
 #include <driver/i2s.h>
 
-// Resolved at runtime by mDNS; falls back to the fixed IP above if not found.
+#ifndef USE_MDNS
+#define USE_MDNS 1
+#endif
+
+// Resolved at runtime by mDNS (if USE_MDNS); otherwise / on a miss, BRIDGE_HOST.
 String   g_bridgeHost = BRIDGE_HOST;
 uint16_t g_bridgePort = BRIDGE_PORT;
 
@@ -58,14 +66,31 @@ static uint32_t TOTAL_SAMPLES = SAMPLE_RATE * RECORD_SECONDS * NUM_CHANNELS;
 static uint32_t PCM_BYTES     = TOTAL_SAMPLES * (BITS_PER_SAMPLE / 8);
 static uint32_t WAV_TOTAL     = WAV_HEADER_SIZE + PCM_BYTES;
 
+// Recording buffer: allocated ONCE in setup() (before WiFi takes its heap) and
+// kept for the device's lifetime, so heap fragmentation can't shrink it later.
+static uint8_t* g_wav = nullptr;
+
+// Amp DMA ring = 8 bufs x 256 frames; 4 bytes/frame covers 16-bit stereo.
+#define AMP_DMA_BUF_COUNT 8
+#define AMP_DMA_BUF_LEN   256
+#define AMP_DMA_RING_MAX_BYTES (AMP_DMA_BUF_COUNT * AMP_DMA_BUF_LEN * 4)
+
+// postAndPlay() results: 0 = played; <0 = couldn't reach the bridge
+// (transport error → worth re-discovering); >0 = bridge answered but the
+// request or reply was bad (HTTP status, or PLAY_BAD_REPLY).
+#define PLAY_OK          0
+#define PLAY_NO_WIFI     -1000
+#define PLAY_BAD_REPLY   1
+
 // ── forward decls ───────────────────────────────────────────────────────────
 void setupWiFi();
-void discoverBridge();
+void discoverBridge(bool keepCurrentOnMiss);
 bool setupMicI2S();
 bool setupAmpI2S();
 void buildWAVHeader(uint8_t* h, uint32_t pcmBytes, uint32_t sr);
 void recordWAV(uint8_t* buf);
-bool postAndPlay(const uint8_t* wav, size_t len);
+int  postAndPlay(const uint8_t* wav, size_t len);
+bool allocRecordBuffer();
 void blinkError(int n);
 void led(bool on) { digitalWrite(STATUS_LED_PIN, on ? HIGH : LOW); }
 
@@ -79,9 +104,17 @@ void setup() {
   led(false);
   pinMode(PTT_PIN, INPUT_PULLUP);
 
+  // Grab the big buffer before WiFi/lwIP carve up the heap.
+  if (!allocRecordBuffer()) {
+    Serial.println("[MEM] can't allocate recording buffer — rebooting");
+    blinkError(6); delay(1000); ESP.restart();
+  }
+
   setupWiFi();
+#if USE_MDNS
   MDNS.begin("hermes-satellite");
-  discoverBridge();      // find the PC brain by name; falls back to the fixed IP
+#endif
+  discoverBridge(false); // find the PC brain by name; falls back to the fixed IP
 
   if (!setupMicI2S()) { Serial.println("[ERR] mic I2S"); while (true){ blinkError(3); delay(1500);} }
   if (!setupAmpI2S()) { Serial.println("[ERR] amp I2S"); while (true){ blinkError(5); delay(1500);} }
@@ -92,29 +125,48 @@ void setup() {
 
 // ── loop ────────────────────────────────────────────────────────────────────
 void loop() {
-  if (digitalRead(PTT_PIN) != LOW) return;
+  if (digitalRead(PTT_PIN) != LOW) { delay(5); return; }   // idle: don't spin the core flat out
   delay(30);
   if (digitalRead(PTT_PIN) != LOW) return;
-  Serial.println("[PTT] recording…");
 
-  uint8_t* wav = (uint8_t*)malloc(WAV_TOTAL);
-  if (!wav) {                        // low RAM fallback: try 2 seconds
-    Serial.println("[MEM] 3s failed, trying 2s");
-    TOTAL_SAMPLES = SAMPLE_RATE * 2; PCM_BYTES = TOTAL_SAMPLES * 2; WAV_TOTAL = WAV_HEADER_SIZE + PCM_BYTES;
-    wav = (uint8_t*)malloc(WAV_TOTAL);
+  // Check the link BEFORE recording, so a dropped WiFi doesn't waste the utterance.
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("[WiFi] not connected — reconnecting, try again in a moment");
+    WiFi.reconnect();
+    blinkError(2);
+    while (digitalRead(PTT_PIN) == LOW) delay(10);
+    return;
   }
-  if (!wav) { Serial.println("[MEM] out of memory"); blinkError(6); return; }
 
+  Serial.println("[PTT] recording…");
   led(true);
-  recordWAV(wav);
+  recordWAV(g_wav);
   led(false);
 
-  bool ok = postAndPlay(wav, WAV_TOTAL);
-  free(wav);
-  if (!ok) { blinkError(4); discoverBridge(); }   // couldn't reach it — maybe its IP moved; re-find
+  int rc = postAndPlay(g_wav, WAV_TOTAL);
+  if (rc != PLAY_OK) {
+    blinkError(4);
+    // Only a transport failure suggests the bridge moved. An HTTP status
+    // (e.g. 401 bad token, 500) means we reached it — re-discovering would
+    // just block the button for ~10 s.
+    if (rc < 0 && rc != PLAY_NO_WIFI) discoverBridge(true);
+  }
 
   Serial.println("[PTT] done — release button");
   while (digitalRead(PTT_PIN) == LOW) delay(10);
+}
+
+// ── recording buffer (once, at boot) ────────────────────────────────────────
+bool allocRecordBuffer() {
+  g_wav = (uint8_t*)malloc(WAV_TOTAL);
+  if (g_wav) return true;
+  Serial.printf("[MEM] %u s buffer (%u bytes) failed, trying 2 s\n",
+                (unsigned)RECORD_SECONDS, (unsigned)WAV_TOTAL);
+  TOTAL_SAMPLES = SAMPLE_RATE * 2 * NUM_CHANNELS;
+  PCM_BYTES     = TOTAL_SAMPLES * (BITS_PER_SAMPLE / 8);
+  WAV_TOTAL     = WAV_HEADER_SIZE + PCM_BYTES;
+  g_wav = (uint8_t*)malloc(WAV_TOTAL);
+  return g_wav != nullptr;
 }
 
 // ── WiFi (direct connect) ───────────────────────────────────────────────────
@@ -135,6 +187,7 @@ void setupWiFi() {
     Serial.printf("   %2d) ch%2d %4d dBm  %s  \"%s\"\n", i + 1, WiFi.channel(i),
                   WiFi.RSSI(i), (WiFi.encryptionType(i) == WIFI_AUTH_OPEN ? "open" : "enc "), s.c_str());
   }
+  WiFi.scanDelete();   // free the scan results — they'd otherwise sit on the heap forever
   Serial.printf("[WiFi] target \"%s\" %s in 2.4 GHz scan\n",
                 WIFI_SSID, foundTarget ? "FOUND ✓" : "NOT found ✗ (still 5 GHz / out of range)");
 
@@ -153,7 +206,10 @@ void setupWiFi() {
 }
 
 // ── Find the PC brain by name (mDNS: _hermes._tcp) ──────────────────────────
-void discoverBridge() {
+// keepCurrentOnMiss: on a re-discovery, a transient mDNS miss keeps the host we
+// already have instead of overwriting a good mDNS-found address with BRIDGE_HOST.
+void discoverBridge(bool keepCurrentOnMiss) {
+#if USE_MDNS
   Serial.println("[mDNS] looking for the Hermes brain…");
   for (int attempt = 0; attempt < 3; attempt++) {
     int n = MDNS.queryService("hermes", "tcp");   // matches the bridge's _hermes._tcp
@@ -165,9 +221,17 @@ void discoverBridge() {
     }
     delay(600);
   }
+  if (keepCurrentOnMiss) {
+    Serial.printf("[mDNS] not found — keeping %s:%u\n", g_bridgeHost.c_str(), g_bridgePort);
+    return;
+  }
+  Serial.printf("[mDNS] not found — using fixed %s:%u\n", BRIDGE_HOST, BRIDGE_PORT);
+#else
+  (void)keepCurrentOnMiss;
+  Serial.printf("[Bridge] mDNS off — using fixed %s:%u\n", BRIDGE_HOST, BRIDGE_PORT);
+#endif
   g_bridgeHost = BRIDGE_HOST;
   g_bridgePort = BRIDGE_PORT;
-  Serial.printf("[mDNS] not found — using fixed %s:%u\n", BRIDGE_HOST, BRIDGE_PORT);
 }
 
 // ── mic (I2S RX) ────────────────────────────────────────────────────────────
@@ -202,7 +266,7 @@ bool setupAmpI2S() {
     .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,
     .communication_format = I2S_COMM_FORMAT_STAND_I2S,
     .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
-    .dma_buf_count = 8, .dma_buf_len = 256,
+    .dma_buf_count = AMP_DMA_BUF_COUNT, .dma_buf_len = AMP_DMA_BUF_LEN,
     .use_apll = false, .tx_desc_auto_clear = true, .fixed_mclk = 0,
   };
   i2s_pin_config_t pins = {
@@ -261,58 +325,93 @@ void recordWAV(uint8_t* buf) {
 }
 
 // ── POST audio, STREAM reply straight to the speaker ────────────────────────
-bool postAndPlay(const uint8_t* wav, size_t len) {
-  if (WiFi.status() != WL_CONNECTED) { Serial.println("[HTTP] no wifi"); return false; }
+// Returns PLAY_OK, a negative transport error, or a positive HTTP status /
+// PLAY_BAD_REPLY (see the PLAY_* defines at the top).
+int postAndPlay(const uint8_t* wav, size_t len) {
+  if (WiFi.status() != WL_CONNECTED) { Serial.println("[HTTP] no wifi"); return PLAY_NO_WIFI; }
   HTTPClient http;
   char url[96];
   snprintf(url, sizeof(url), "http://%s:%u%s", g_bridgeHost.c_str(), g_bridgePort, BRIDGE_PATH);
   http.begin(url);
+  http.setReuse(false);              // ask the bridge to close the socket after the reply
   http.setTimeout(BRIDGE_TIMEOUT_MS);
   http.addHeader("Content-Type", "audio/wav");
-  http.addHeader("X-Hermes-Token", BRIDGE_TOKEN);
+  if (BRIDGE_TOKEN[0] != '\0') http.addHeader("X-Hermes-Token", BRIDGE_TOKEN);  // "" = no token
   Serial.printf("[HTTP] POST %u bytes -> %s\n", (unsigned)len, url);
 
   int code = http.POST((uint8_t*)wav, len);
   if (code != HTTP_CODE_OK) {
     Serial.printf("[HTTP] failed: %d (%s)\n", code, http.errorToString(code).c_str());
-    http.end(); return false;
+    http.end();
+    return code;                     // <0 transport error, >0 HTTP status
   }
 
   WiFiClient* s = http.getStreamPtr();
+  int bodySize = http.getSize();     // Content-Length, or -1 if the server didn't send one
 
-  // read + parse the 44-byte WAV header
+  // read + parse the 44-byte WAV header (deadlines use elapsed time, so
+  // they survive the millis() wrap every ~49.7 days)
   uint8_t hdr[WAV_HEADER_SIZE]; int hp = 0;
-  unsigned long dl = millis() + BRIDGE_TIMEOUT_MS;
-  while (hp < WAV_HEADER_SIZE && millis() < dl) {
+  unsigned long t0 = millis();
+  while (hp < WAV_HEADER_SIZE && millis() - t0 < BRIDGE_TIMEOUT_MS) {
     if (s->available()) hdr[hp++] = s->read();
-    else if (!http.connected() && !s->available()) break;
+    else if (!http.connected()) break;
+    else delay(1);                   // don't spin the core while waiting
   }
-  if (hp < WAV_HEADER_SIZE) { Serial.println("[Play] short reply"); http.end(); return false; }
+  if (hp < WAV_HEADER_SIZE) { Serial.println("[Play] short reply"); http.end(); return PLAY_BAD_REPLY; }
 
   uint32_t sr = hdr[24]|(hdr[25]<<8)|(hdr[26]<<16)|((uint32_t)hdr[27]<<24);
   uint16_t bits = hdr[34]|(hdr[35]<<8);
   uint16_t ch = hdr[22]|(hdr[23]<<8);
+  if (memcmp(hdr, "RIFF", 4) != 0 || memcmp(hdr + 8, "WAVE", 4) != 0 ||
+      bits != 16 || (ch != 1 && ch != 2)) {
+    Serial.printf("[Play] not a 16-bit mono/stereo WAV (bits=%u ch=%u) — skipping\n", bits, ch);
+    http.end(); return PLAY_BAD_REPLY;
+  }
   if (sr < 8000 || sr > 48000) sr = SAMPLE_RATE;
   Serial.printf("[Play] %u Hz %u-bit %u-ch (streaming)\n", sr, bits, ch);
-  i2s_set_clk(I2S_AMP_PORT, sr, (i2s_bits_per_sample_t)(bits?bits:16),
-              ch==2 ? I2S_CHANNEL_STEREO : I2S_CHANNEL_MONO);
+  if (i2s_set_clk(I2S_AMP_PORT, sr, I2S_BITS_PER_SAMPLE_16BIT,
+                  ch == 2 ? I2S_CHANNEL_STEREO : I2S_CHANNEL_MONO) != ESP_OK) {
+    Serial.println("[Play] i2s_set_clk failed");
+    http.end(); return PLAY_BAD_REPLY;
+  }
 
-  // stream the rest straight to the amp
+  // stream the rest straight to the amp. Stop when Content-Length bytes have
+  // arrived (don't wait for a keep-alive socket to close), the server closes,
+  // or nothing arrives for 3 s once audio has started.
+  long remaining = bodySize > 0 ? (long)bodySize - WAV_HEADER_SIZE : -1;
   uint8_t chunk[1024]; size_t w;
-  dl = millis() + BRIDGE_TIMEOUT_MS;
-  while (millis() < dl) {
+  unsigned long idleLimit = BRIDGE_TIMEOUT_MS;   // first audio bytes may take a while
+  t0 = millis();
+  while (remaining != 0 && millis() - t0 < idleLimit) {
     size_t avail = s->available();
     if (avail) {
-      int n = s->readBytes(chunk, avail > sizeof(chunk) ? sizeof(chunk) : avail);
-      if (n > 0) { i2s_write(I2S_AMP_PORT, chunk, n, &w, portMAX_DELAY); dl = millis() + 3000; }
+      size_t want = avail > sizeof(chunk) ? sizeof(chunk) : avail;
+      if (remaining > 0 && (long)want > remaining) want = (size_t)remaining;
+      int n = s->readBytes(chunk, want);
+      if (n > 0) {
+        i2s_write(I2S_AMP_PORT, chunk, n, &w, portMAX_DELAY);
+        if (remaining > 0) remaining -= n;
+        t0 = millis();
+        idleLimit = 3000;
+      }
     } else if (!http.connected()) break;
     else delay(2);
+  }
+
+  // i2s_write returns once data is in the DMA ring, not once it has played.
+  // Push a full ring of silence so the real tail drains to the speaker before
+  // we clear the buffers and retune the clock — otherwise the last ~100 ms
+  // (often the final syllable) gets cut off.
+  memset(chunk, 0, sizeof(chunk));
+  for (size_t pushed = 0; pushed < AMP_DMA_RING_MAX_BYTES; pushed += sizeof(chunk)) {
+    i2s_write(I2S_AMP_PORT, chunk, sizeof(chunk), &w, portMAX_DELAY);
   }
   i2s_zero_dma_buffer(I2S_AMP_PORT);
   i2s_set_clk(I2S_AMP_PORT, SAMPLE_RATE, I2S_BITS_PER_SAMPLE_16BIT, I2S_CHANNEL_MONO);
   http.end();
   Serial.println("[Play] done");
-  return true;
+  return PLAY_OK;
 }
 
 void blinkError(int n){ for(int i=0;i<n;i++){ led(true);delay(120);led(false);delay(120);} }

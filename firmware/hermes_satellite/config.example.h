@@ -5,9 +5,11 @@
 #pragma once
 
 // -- Bridge (the PC running hermes_bridge.py) ---------------------------------
-// Leave USE_MDNS = 1 and the satellite finds your PC automatically by name.
-// BRIDGE_HOST is only the FALLBACK if auto-discovery fails — set it to the IP
-// the bridge prints on startup (e.g. "192.168.1.50").
+// USE_MDNS = 1: the satellite finds your PC automatically by name, and
+// BRIDGE_HOST is only the FALLBACK if auto-discovery fails.
+// USE_MDNS = 0: always use BRIDGE_HOST. Safer on a shared network — with mDNS
+// on, any LAN device that advertises _hermes._tcp receives your token + audio.
+// Set BRIDGE_HOST to the IP the bridge prints on startup (e.g. "192.168.1.50").
 #define USE_MDNS       1
 #define BRIDGE_HOST    "192.168.1.50"
 #define BRIDGE_PORT    8787
